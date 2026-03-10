@@ -79,6 +79,7 @@ type CommonFlags struct {
 	AnalysisCacheClearStrategy             *string
 	CompareQueriesAroundAnalysisCacheClear bool
 	FilterIncompatibleTargets              bool
+	QueryBackend                           *string
 }
 
 func StrPtr() *string {
@@ -101,6 +102,7 @@ func RegisterCommonFlags() *CommonFlags {
 		AnalysisCacheClearStrategy:             StrPtr(),
 		CompareQueriesAroundAnalysisCacheClear: false,
 		FilterIncompatibleTargets:              true,
+		QueryBackend:                           StrPtr(),
 	}
 	flag.BoolVar(&commonFlags.Version, "version", false, "Print the version of the tool and exit.")
 	flag.StringVar(commonFlags.WorkingDirectory, "working-directory", ".", "Working directory to query.")
@@ -121,6 +123,7 @@ func RegisterCommonFlags() *CommonFlags {
 	flag.StringVar(commonFlags.AnalysisCacheClearStrategy, "analysis-cache-clear-strategy", "skip", "Strategy for clearing the analysis cache. Accepted values: skip,shutdown,discard.")
 	flag.BoolVar(&commonFlags.CompareQueriesAroundAnalysisCacheClear, "compare-queries-around-analysis-cache-clear", false, "Whether to check for query result differences before and after analysis cache clears. This is a temporary flag for performing real-world analysis.")
 	flag.BoolVar(&commonFlags.FilterIncompatibleTargets, "filter-incompatible-targets", true, "Whether to filter out incompatible targets from the candidate set of affected targets.")
+	flag.StringVar(commonFlags.QueryBackend, "query-backend", "cquery", "Query backend to use for target discovery. Accepted values: cquery, query. 'query' is faster but less precise (no configuration resolution, no select() resolution, no incompatible target filtering).")
 	return &commonFlags
 }
 
@@ -146,6 +149,11 @@ func ValidateCommonFlags(commandName string, flags *CommonFlags) (targetPattern 
 }
 
 func ResolveCommonConfig(commonFlags *CommonFlags, beforeRevStr string) (*CommonConfig, error) {
+
+	// Flag validation
+	if *commonFlags.QueryBackend == "query" && *commonFlags.AnalysisCacheClearStrategy != "skip" {
+		return nil, fmt.Errorf("--analysis-cache-clear-strategy=%s is incompatible with --query-backend=query: bazel query does not use the analysis cache", *commonFlags.AnalysisCacheClearStrategy)
+	}
 
 	// Context attributes
 
@@ -187,6 +195,7 @@ func ResolveCommonConfig(commonFlags *CommonFlags, beforeRevStr string) (*Common
 		CompareQueriesAroundAnalysisCacheClear: commonFlags.CompareQueriesAroundAnalysisCacheClear,
 		FilterIncompatibleTargets:              commonFlags.FilterIncompatibleTargets,
 		EnforceCleanRepo:                       commonFlags.EnforceCleanRepo == EnforceClean,
+		QueryBackend:                           *commonFlags.QueryBackend,
 	}
 
 	// Non-context attributes
