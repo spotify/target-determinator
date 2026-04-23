@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -27,11 +28,14 @@ import (
 // NewTargetHashCache creates a TargetHashCache which uses context for metadata lookups.
 // When forceDisableConfiguredRuleInputs is true, ConfiguredRuleInput will not be used regardless
 // of Bazel version. This is needed for the query backend which doesn't populate ConfiguredRuleInput.
+// ruleClassFingerprints, if non-nil, contributes extra bytes to the hash of each rule whose class
+// matches one of the entry's globs.
 func NewTargetHashCache(
 	context map[gazelle_label.Label]map[Configuration]*analysis.ConfiguredTarget,
 	normalizer *Normalizer,
 	bazelRelease string,
 	forceDisableConfiguredRuleInputs bool,
+	ruleClassFingerprints []RuleClassFingerprintDigests,
 ) *TargetHashCache {
 	bazelVersionSupportsConfiguredRuleInputs := isConfiguredRuleInputsSupported(bazelRelease)
 	if forceDisableConfiguredRuleInputs {
@@ -48,7 +52,28 @@ func NewTargetHashCache(
 		bazelVersionSupportsConfiguredRuleInputs: bazelVersionSupportsConfiguredRuleInputs,
 		cache:                                    make(map[gazelle_label.Label]map[Configuration]*cacheEntry),
 		frozen:                                   false,
+		ruleClassFingerprints:                    ruleClassFingerprints,
 	}
+}
+
+// RuleClassFingerprintDigests pairs a set of rule-class globs with precomputed file digests.
+// Each digest is written to the rule hash when the rule's class matches any of the globs.
+type RuleClassFingerprintDigests struct {
+	// RuleClassGlobs are Go path.Match-style globs (e.g. "java_*"). Matched case-sensitively
+	// against rule.GetRuleClass().
+	RuleClassGlobs []string
+	// Digests are sha256 hashes of the fingerprint file contents, sorted by the underlying
+	// file path for determinism.
+	Digests [][]byte
+}
+
+func ruleClassMatchesAnyGlob(ruleClass string, globs []string) bool {
+	for _, g := range globs {
+		if matched, err := path.Match(g, ruleClass); err == nil && matched {
+			return true
+		}
+	}
+	return false
 }
 
 func isConfiguredRuleInputsSupported(releaseString string) bool {
@@ -80,6 +105,8 @@ type TargetHashCache struct {
 
 	cacheLock sync.Mutex
 	cache     map[gazelle_label.Label]map[Configuration]*cacheEntry
+
+	ruleClassFingerprints []RuleClassFingerprintDigests
 }
 
 var labelNotFound = fmt.Errorf("label not found in context")
@@ -566,6 +593,15 @@ func hashRule(thc *TargetHashCache, rule *build.Rule, configuration *analysis.Co
 	hasher.Write([]byte(rule.GetRuleClass()))
 	hasher.Write([]byte(rule.GetSkylarkEnvironmentHashCode()))
 	hasher.Write([]byte(configuration.GetChecksum()))
+
+	ruleClass := rule.GetRuleClass()
+	for _, entry := range thc.ruleClassFingerprints {
+		if ruleClassMatchesAnyGlob(ruleClass, entry.RuleClassGlobs) {
+			for _, digest := range entry.Digests {
+				hasher.Write(digest)
+			}
+		}
+	}
 
 	// TODO: Consider using `$internal_attr_hash` from https://github.com/bazelbuild/bazel/blob/6971b016f1e258e3bb567a0f9fe7a88ad565d8f2/src/main/java/com/google/devtools/build/lib/query2/query/output/SyntheticAttributeHashCalculator.java
 	// rather than hashing attributes ourselves.

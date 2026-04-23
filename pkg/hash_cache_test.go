@@ -385,7 +385,16 @@ func parseResult(t *testing.T, result *analysis.CqueryResult, bazelRelease strin
 	if err != nil {
 		t.Fatalf("Failed to parse cquery result: %v", err)
 	}
-	return NewTargetHashCache(cqueryResult, &n, bazelRelease, false)
+	return NewTargetHashCache(cqueryResult, &n, bazelRelease, false, nil)
+}
+
+func parseResultWithFingerprints(t *testing.T, result *analysis.CqueryResult, bazelRelease string, fingerprints []RuleClassFingerprintDigests) *TargetHashCache {
+	n := Normalizer{}
+	cqueryResult, err := ParseCqueryResult(result.Results, &n)
+	if err != nil {
+		t.Fatalf("Failed to parse cquery result: %v", err)
+	}
+	return NewTargetHashCache(cqueryResult, &n, bazelRelease, false, fingerprints)
 }
 
 func areHashesEqual(left, right []byte) bool {
@@ -399,6 +408,132 @@ func mustParseLabel(s string) label.Label {
 		panic(err)
 	}
 	return l
+}
+
+func TestRuleClassFingerprintMixing(t *testing.T) {
+	const defaultBazelVersion = "release 5.1.1"
+	labelAndConfiguration := LabelAndConfiguration{
+		Label:         mustParseLabel("//HelloWorld:HelloWorld"),
+		Configuration: NormalizeConfiguration(configurationChecksum),
+	}
+	libLabelAndConfiguration := LabelAndConfiguration{
+		Label:         mustParseLabel("//HelloWorld:GreetingLib"),
+		Configuration: NormalizeConfiguration(configurationChecksum),
+	}
+
+	fingerprintFile := filepath.Join(t.TempDir(), "fingerprint.data")
+	if err := os.WriteFile(fingerprintFile, []byte("v1"), 0o644); err != nil {
+		t.Fatalf("failed to write fingerprint file: %v", err)
+	}
+
+	digestV1, err := PrecomputeRuleClassFingerprints("", []RuleClassFingerprint{
+		{RuleClassGlobs: []string{"java_binary"}, Files: []string{fingerprintFile}},
+	})
+	if err != nil {
+		t.Fatalf("precompute failed: %v", err)
+	}
+
+	_, cqueryResult := layoutProject(t)
+
+	// Matching rule class (java_binary) — hash should include the digest.
+	thcWithFingerprint := parseResultWithFingerprints(t, cqueryResult, defaultBazelVersion, digestV1)
+	binHashV1, err := thcWithFingerprint.Hash(labelAndConfiguration)
+	if err != nil {
+		t.Fatalf("failed to hash java_binary target: %v", err)
+	}
+	// Non-matching rule class (java_library) — hash should NOT be influenced by the fingerprint.
+	libHashV1, err := thcWithFingerprint.Hash(libLabelAndConfiguration)
+	if err != nil {
+		t.Fatalf("failed to hash java_library target: %v", err)
+	}
+
+	// Same thc, no fingerprints configured — baseline.
+	thcBaseline := parseResult(t, cqueryResult, defaultBazelVersion)
+	binHashBaseline, err := thcBaseline.Hash(labelAndConfiguration)
+	if err != nil {
+		t.Fatalf("failed to hash baseline java_binary target: %v", err)
+	}
+	libHashBaseline, err := thcBaseline.Hash(libLabelAndConfiguration)
+	if err != nil {
+		t.Fatalf("failed to hash baseline java_library target: %v", err)
+	}
+
+	if areHashesEqual(binHashV1, binHashBaseline) {
+		t.Fatalf("expected java_binary hash to differ when a matching fingerprint is configured, but they were equal: %v", hex.EncodeToString(binHashV1))
+	}
+	if !areHashesEqual(libHashV1, libHashBaseline) {
+		t.Fatalf("expected java_library hash to be unaffected by a java_binary-only fingerprint, but differed: %v vs %v", hex.EncodeToString(libHashV1), hex.EncodeToString(libHashBaseline))
+	}
+
+	// Changing the fingerprint file's content changes the java_binary hash.
+	if err := os.WriteFile(fingerprintFile, []byte("v2"), 0o644); err != nil {
+		t.Fatalf("failed to rewrite fingerprint file: %v", err)
+	}
+	digestV2, err := PrecomputeRuleClassFingerprints("", []RuleClassFingerprint{
+		{RuleClassGlobs: []string{"java_binary"}, Files: []string{fingerprintFile}},
+	})
+	if err != nil {
+		t.Fatalf("precompute failed: %v", err)
+	}
+	_, cqueryResultFresh := layoutProject(t)
+	thcV2 := parseResultWithFingerprints(t, cqueryResultFresh, defaultBazelVersion, digestV2)
+	binHashV2, err := thcV2.Hash(labelAndConfiguration)
+	if err != nil {
+		t.Fatalf("failed to hash java_binary target at v2: %v", err)
+	}
+	if areHashesEqual(binHashV1, binHashV2) {
+		t.Fatalf("expected java_binary hash to change when the fingerprint file content changes, but they were equal: %v", hex.EncodeToString(binHashV1))
+	}
+
+	// Determinism: two entry orderings with the same set of fingerprints yield identical hashes.
+	second := filepath.Join(t.TempDir(), "other.data")
+	if err := os.WriteFile(second, []byte("other"), 0o644); err != nil {
+		t.Fatalf("failed to write second fingerprint: %v", err)
+	}
+	orderA, err := PrecomputeRuleClassFingerprints("", []RuleClassFingerprint{
+		{RuleClassGlobs: []string{"java_binary"}, Files: []string{fingerprintFile}},
+		{RuleClassGlobs: []string{"*"}, Files: []string{second}},
+	})
+	if err != nil {
+		t.Fatalf("precompute failed: %v", err)
+	}
+	orderB, err := PrecomputeRuleClassFingerprints("", []RuleClassFingerprint{
+		{RuleClassGlobs: []string{"*"}, Files: []string{second}},
+		{RuleClassGlobs: []string{"java_binary"}, Files: []string{fingerprintFile}},
+	})
+	if err != nil {
+		t.Fatalf("precompute failed: %v", err)
+	}
+	_, cqueryResultA := layoutProject(t)
+	_, cqueryResultB := layoutProject(t)
+	hashA, err := parseResultWithFingerprints(t, cqueryResultA, defaultBazelVersion, orderA).Hash(labelAndConfiguration)
+	if err != nil {
+		t.Fatalf("failed to hash A: %v", err)
+	}
+	hashB, err := parseResultWithFingerprints(t, cqueryResultB, defaultBazelVersion, orderB).Hash(labelAndConfiguration)
+	if err != nil {
+		t.Fatalf("failed to hash B: %v", err)
+	}
+	if !areHashesEqual(hashA, hashB) {
+		t.Fatalf("expected flag-order-independent hashes, but got %v vs %v", hex.EncodeToString(hashA), hex.EncodeToString(hashB))
+	}
+
+	// "*" glob matches every rule class.
+	wildcardDigests, err := PrecomputeRuleClassFingerprints("", []RuleClassFingerprint{
+		{RuleClassGlobs: []string{"*"}, Files: []string{fingerprintFile}},
+	})
+	if err != nil {
+		t.Fatalf("precompute failed: %v", err)
+	}
+	_, cqueryResultW := layoutProject(t)
+	thcW := parseResultWithFingerprints(t, cqueryResultW, defaultBazelVersion, wildcardDigests)
+	libHashW, err := thcW.Hash(libLabelAndConfiguration)
+	if err != nil {
+		t.Fatalf("failed to hash java_library with wildcard fingerprint: %v", err)
+	}
+	if areHashesEqual(libHashW, libHashBaseline) {
+		t.Fatalf("expected wildcard fingerprint to affect java_library hash, but it did not")
+	}
 }
 
 func Test_isConfiguredRuleInputsSupported(t *testing.T) {
