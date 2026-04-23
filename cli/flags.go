@@ -33,6 +33,49 @@ func (i *IgnoreFileFlag) Set(value string) error {
 	return nil
 }
 
+type RuleClassFingerprintFlag []pkg.RuleClassFingerprint
+
+func (f *RuleClassFingerprintFlag) String() string {
+	parts := make([]string, 0, len(*f))
+	for _, e := range *f {
+		parts = append(parts, strings.Join(e.RuleClassGlobs, ",")+":"+strings.Join(e.Files, ","))
+	}
+	return "[" + strings.Join(parts, " ") + "]"
+}
+
+func (f *RuleClassFingerprintFlag) Set(value string) error {
+	idx := strings.Index(value, ":")
+	if idx < 0 {
+		return fmt.Errorf("invalid --rule-class-fingerprint value %q: expected <rule_class_glob>[,<rule_class_glob>...]:<path>[,<path>...]", value)
+	}
+	globsPart := strings.TrimSpace(value[:idx])
+	filesPart := strings.TrimSpace(value[idx+1:])
+	if globsPart == "" || filesPart == "" {
+		return fmt.Errorf("invalid --rule-class-fingerprint value %q: rule-class globs and file list must both be non-empty", value)
+	}
+	globs := splitAndTrim(globsPart)
+	files := splitAndTrim(filesPart)
+	for _, g := range globs {
+		if _, err := path.Match(g, ""); err != nil {
+			return fmt.Errorf("invalid rule-class glob %q: %w", g, err)
+		}
+	}
+	*f = append(*f, pkg.RuleClassFingerprint{RuleClassGlobs: globs, Files: files})
+	return nil
+}
+
+func splitAndTrim(s string) []string {
+	parts := strings.Split(s, ",")
+	out := parts[:0]
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
 type EnforceCleanFlag int
 
 const (
@@ -84,6 +127,7 @@ type CommonFlags struct {
 	CacheDirectory                         *string
 	NoCacheResults                         bool
 	QueryBackend                           *string
+	RuleClassFingerprints                  *RuleClassFingerprintFlag
 }
 
 func StrPtr() *string {
@@ -109,6 +153,7 @@ func RegisterCommonFlags() *CommonFlags {
 		CacheDirectory:                         StrPtr(),
 		NoCacheResults:                         false,
 		QueryBackend:                           StrPtr(),
+		RuleClassFingerprints:                  &RuleClassFingerprintFlag{},
 	}
 	flag.BoolVar(&commonFlags.Version, "version", false, "Print the version of the tool and exit.")
 	flag.StringVar(commonFlags.WorkingDirectory, "working-directory", ".", "Working directory to query.")
@@ -132,6 +177,7 @@ func RegisterCommonFlags() *CommonFlags {
 	flag.StringVar(commonFlags.CacheDirectory, "cache-dir", defaultCacheDir(), "Cache directory to avoid existing re-computations. Note: home- and system- bazelrc files, environment variables, and host hardware/OS are not included in the results cache key. Use --nocache_results if necessary.")
 	flag.BoolVar(&commonFlags.NoCacheResults, "nocache_results", false, "Disable loading and saving of results to the cache.")
 	flag.StringVar(commonFlags.QueryBackend, "query-backend", "cquery", "Query backend to use for target discovery. Accepted values: cquery, query. 'query' is faster but less precise (no configuration resolution, no select() resolution, no incompatible target filtering).")
+	flag.Var(commonFlags.RuleClassFingerprints, "rule-class-fingerprint", "Mix the content of <file>s into the hash of any target whose rule class matches one of <glob>s. Format: '<glob>[,<glob>...]:<file>[,<file>...]'. Globs use Go path.Match syntax (e.g., 'java_*'). File paths are relative to --working-directory. Repeatable. Useful under --query-backend=query to capture toolchain/module changes that the loading phase doesn't see.")
 	return &commonFlags
 }
 
@@ -214,6 +260,7 @@ func ResolveCommonConfig(commonFlags *CommonFlags, beforeRevStr string) (*Common
 		CacheDirectory:                         *commonFlags.CacheDirectory,
 		NoCacheResults:                         commonFlags.NoCacheResults,
 		QueryBackend:                           *commonFlags.QueryBackend,
+		RuleClassFingerprints:                  []pkg.RuleClassFingerprint(*commonFlags.RuleClassFingerprints),
 	}
 
 	// Non-context attributes

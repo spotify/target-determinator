@@ -152,6 +152,7 @@ func resolveConfig(flags hashPersisterFlags) (*config, error) {
 		FilterIncompatibleTargets:              flags.commonFlags.FilterIncompatibleTargets,
 		EnforceCleanRepo:                       flags.commonFlags.EnforceCleanRepo == cli.EnforceClean,
 		QueryBackend:                           *flags.commonFlags.QueryBackend,
+		RuleClassFingerprints:                  []pkg.RuleClassFingerprint(*flags.commonFlags.RuleClassFingerprints),
 	}
 
 	targetsList, err := pkg.ParseTargetsList(*flags.commonFlags.TargetsFlag)

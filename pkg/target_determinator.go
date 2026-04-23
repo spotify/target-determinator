@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"crypto/sha1"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	path2 "path"
+	"path/filepath"
 	"reflect"
 	"runtime"
 	"sort"
@@ -151,6 +153,101 @@ type Context struct {
 	// "query" operates at the loading phase and is faster but less precise: no configuration
 	// information, no select() resolution, no incompatible target filtering.
 	QueryBackend string
+	// RuleClassFingerprints mixes the contents of extra files into the hash of any target whose
+	// rule class matches one of the globs. Useful under --query-backend=query to capture changes
+	// that the loading phase doesn't see (e.g., a sub-module MODULE.bazel referenced via
+	// local_path_override that pins a toolchain version).
+	RuleClassFingerprints []RuleClassFingerprint
+}
+
+// RuleClassFingerprint associates a set of rule-class globs with a set of files whose hashed
+// content should be mixed into each matching target's rule hash.
+type RuleClassFingerprint struct {
+	// RuleClassGlobs are Go path.Match-style globs matched against rule.GetRuleClass().
+	RuleClassGlobs []string
+	// Files are paths (relative to the workspace, or absolute) whose content is hashed.
+	Files []string
+}
+
+// String returns a stable, canonical rendering used as a cache-key component. Globs and files
+// are sorted so flag ordering does not affect the key.
+func (f RuleClassFingerprint) String() string {
+	globs := append([]string(nil), f.RuleClassGlobs...)
+	sort.Strings(globs)
+	files := append([]string(nil), f.Files...)
+	sort.Strings(files)
+	return strings.Join(globs, ",") + ":" + strings.Join(files, ",")
+}
+
+// PrecomputeRuleClassFingerprints reads every fingerprint file once, hashes it, and returns the
+// digests packaged alongside their globs. Output is sorted deterministically (entries by first
+// glob; globs and digests within an entry by underlying value) so flag ordering does not affect
+// the eventual rule hash. Returns an error if any file cannot be read.
+func PrecomputeRuleClassFingerprints(workspacePath string, fingerprints []RuleClassFingerprint) ([]RuleClassFingerprintDigests, error) {
+	if len(fingerprints) == 0 {
+		return nil, nil
+	}
+
+	fileDigests := make(map[string][]byte)
+	resolve := func(p string) string {
+		if filepath.IsAbs(p) {
+			return p
+		}
+		return filepath.Join(workspacePath, p)
+	}
+
+	for _, fp := range fingerprints {
+		for _, f := range fp.Files {
+			absPath := resolve(f)
+			if _, ok := fileDigests[absPath]; ok {
+				continue
+			}
+			contents, err := os.ReadFile(absPath)
+			if err != nil {
+				return nil, fmt.Errorf("failed to read rule-class fingerprint file %s: %w", absPath, err)
+			}
+			sum := sha256.Sum256(contents)
+			fileDigests[absPath] = sum[:]
+		}
+	}
+
+	result := make([]RuleClassFingerprintDigests, 0, len(fingerprints))
+	for _, fp := range fingerprints {
+		globs := append([]string(nil), fp.RuleClassGlobs...)
+		sort.Strings(globs)
+
+		uniquePaths := make(map[string]struct{}, len(fp.Files))
+		paths := make([]string, 0, len(fp.Files))
+		for _, f := range fp.Files {
+			abs := resolve(f)
+			if _, seen := uniquePaths[abs]; seen {
+				continue
+			}
+			uniquePaths[abs] = struct{}{}
+			paths = append(paths, abs)
+		}
+		sort.Strings(paths)
+
+		digests := make([][]byte, 0, len(paths))
+		for _, p := range paths {
+			digests = append(digests, fileDigests[p])
+		}
+
+		result = append(result, RuleClassFingerprintDigests{
+			RuleClassGlobs: globs,
+			Digests:        digests,
+		})
+	}
+	sort.Slice(result, func(i, j int) bool {
+		li, lj := result[i].RuleClassGlobs, result[j].RuleClassGlobs
+		for k := 0; k < len(li) && k < len(lj); k++ {
+			if li[k] != lj[k] {
+				return li[k] < lj[k]
+			}
+		}
+		return len(li) < len(lj)
+	})
+	return result, nil
 }
 
 // FullyProcess returns the before and after metadata maps, with fully filled caches.
@@ -279,6 +376,7 @@ func LoadIncompleteMetadata(context *Context, rev LabelledGitRev, targets Target
 		IncludeDifferences:                     context.IncludeDifferences,
 		NoCacheResults:                         context.NoCacheResults,
 		QueryBackend:                           context.QueryBackend,
+		RuleClassFingerprints:                  context.RuleClassFingerprints,
 	}
 	cleanupFunc := func() {}
 
@@ -786,8 +884,13 @@ func doQueryDeps(context *Context, targets TargetsList) (*QueryResults, error) {
 
 	normalizer := Normalizer{repoMapping}
 
+	ruleClassFingerprintDigests, err := PrecomputeRuleClassFingerprints(context.WorkspacePath, context.RuleClassFingerprints)
+	if err != nil {
+		return nil, err
+	}
+
 	if context.QueryBackend == "query" {
-		return doQueryDepsQueryMode(context, targets, &normalizer, bazelRelease)
+		return doQueryDepsQueryMode(context, targets, &normalizer, bazelRelease, ruleClassFingerprintDigests)
 	}
 
 	// Work around https://github.com/bazelbuild/bazel/issues/21010
@@ -818,7 +921,7 @@ func doQueryDeps(context *Context, targets TargetsList) (*QueryResults, error) {
 				labelsToConfigurations: nil,
 			},
 			TransitiveConfiguredTargets: nil,
-			TargetHashCache:             NewTargetHashCache(nil, &normalizer, bazelRelease, false),
+			TargetHashCache:             NewTargetHashCache(nil, &normalizer, bazelRelease, false, ruleClassFingerprintDigests),
 			BazelRelease:                bazelRelease,
 			QueryError:                  retErr,
 		}, retErr
@@ -882,7 +985,7 @@ func doQueryDeps(context *Context, targets TargetsList) (*QueryResults, error) {
 	queryResults := &QueryResults{
 		MatchingTargets:             matchingTargets,
 		TransitiveConfiguredTargets: transitiveConfiguredTargets,
-		TargetHashCache:             NewTargetHashCache(transitiveConfiguredTargets, &normalizer, bazelRelease, false),
+		TargetHashCache:             NewTargetHashCache(transitiveConfiguredTargets, &normalizer, bazelRelease, false, ruleClassFingerprintDigests),
 		BazelRelease:                bazelRelease,
 		QueryError:                  nil,
 		configurations:              configurations,
@@ -890,7 +993,7 @@ func doQueryDeps(context *Context, targets TargetsList) (*QueryResults, error) {
 	return queryResults, nil
 }
 
-func doQueryDepsQueryMode(context *Context, targets TargetsList, normalizer *Normalizer, bazelRelease string) (*QueryResults, error) {
+func doQueryDepsQueryMode(context *Context, targets TargetsList, normalizer *Normalizer, bazelRelease string, ruleClassFingerprintDigests []RuleClassFingerprintDigests) (*QueryResults, error) {
 	depsPattern := fmt.Sprintf("deps(%s)", targets.String())
 	transitiveResult, err := runToQueryResult(context, depsPattern)
 	if err != nil {
@@ -901,7 +1004,7 @@ func doQueryDepsQueryMode(context *Context, targets TargetsList, normalizer *Nor
 				labelsToConfigurations: nil,
 			},
 			TransitiveConfiguredTargets: nil,
-			TargetHashCache:             NewTargetHashCache(nil, normalizer, bazelRelease, true),
+			TargetHashCache:             NewTargetHashCache(nil, normalizer, bazelRelease, true, ruleClassFingerprintDigests),
 			BazelRelease:                bazelRelease,
 			QueryError:                  retErr,
 		}, retErr
@@ -942,7 +1045,7 @@ func doQueryDepsQueryMode(context *Context, targets TargetsList, normalizer *Nor
 	queryResults := &QueryResults{
 		MatchingTargets:             matchingTargets,
 		TransitiveConfiguredTargets: transitiveConfiguredTargets,
-		TargetHashCache:             NewTargetHashCache(transitiveConfiguredTargets, normalizer, bazelRelease, true),
+		TargetHashCache:             NewTargetHashCache(transitiveConfiguredTargets, normalizer, bazelRelease, true, ruleClassFingerprintDigests),
 		BazelRelease:                bazelRelease,
 		QueryError:                  nil,
 		configurations:              map[Configuration]singleConfigurationOutput{},
