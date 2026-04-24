@@ -30,7 +30,7 @@ func TestDiffSingleLabel_NoDifferenceWhenBothFromCache(t *testing.T) {
 	hashKey := lbl.String() + "\x00" + config.String()
 
 	makeFromCache := func() *QueryResults {
-		thc := NewTargetHashCache(nil, &Normalizer{}, bazelRelease, false)
+		thc := NewTargetHashCache(nil, &Normalizer{}, bazelRelease, false, nil)
 		if err := thc.RestoreHashes(map[string][]byte{hashKey: fakeHash}); err != nil {
 			t.Fatalf("RestoreHashes: %v", err)
 		}
