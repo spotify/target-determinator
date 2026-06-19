@@ -565,7 +565,7 @@ func hashRule(thc *TargetHashCache, rule *build.Rule, configuration *analysis.Co
 	// rather than hashing attributes ourselves.
 	// On the plus side, this builds in some heuristics from Bazel (e.g. ignoring `generator_location`).
 	// On the down side, it would even further decouple our "hashing" and "diffing" procedures.
-	for _, attr := range rule.GetAttribute() {
+	for _, attr := range sortedAttributesForHashing(rule.GetAttribute()) {
 		normalizedAttribute := thc.AttributeForSerialization(attr)
 
 		protoBytes, err := proto.Marshal(normalizedAttribute)
@@ -598,6 +598,21 @@ func hashRule(thc *TargetHashCache, rule *build.Rule, configuration *analysis.Co
 	}
 
 	return hasher.Sum(nil), nil
+}
+
+func sortedAttributesForHashing(attributes []*build.Attribute) []*build.Attribute {
+	sortedAttributes := append([]*build.Attribute(nil), attributes...)
+	sort.SliceStable(sortedAttributes, func(i, j int) bool {
+		leftName := sortedAttributes[i].GetName()
+		rightName := sortedAttributes[j].GetName()
+		if leftName == rightName {
+			leftBytes, _ := proto.MarshalOptions{Deterministic: true}.Marshal(sortedAttributes[i])
+			rightBytes, _ := proto.MarshalOptions{Deterministic: true}.Marshal(sortedAttributes[j])
+			return bytes.Compare(leftBytes, rightBytes) < 0
+		}
+		return leftName < rightName
+	})
+	return sortedAttributes
 }
 
 func getConfiguredRuleInputs(thc *TargetHashCache, rule *build.Rule, ownConfiguration Configuration) ([]LabelAndConfigurations, error) {
@@ -678,7 +693,43 @@ func getConfiguredRuleInputs(thc *TargetHashCache, rule *build.Rule, ownConfigur
 			labelsAndConfigurations = append(labelsAndConfigurations, labelAndConfigurations)
 		}
 	}
-	return labelsAndConfigurations, nil
+	return canonicalizeRuleInputs(labelsAndConfigurations), nil
+}
+
+func canonicalizeRuleInputs(labelsAndConfigurations []LabelAndConfigurations) []LabelAndConfigurations {
+	labelsToConfigurations := make(map[gazelle_label.Label]map[Configuration]struct{})
+	for _, labelAndConfigurations := range labelsAndConfigurations {
+		if _, ok := labelsToConfigurations[labelAndConfigurations.Label]; !ok {
+			labelsToConfigurations[labelAndConfigurations.Label] = make(map[Configuration]struct{})
+		}
+		for _, configuration := range labelAndConfigurations.Configurations {
+			labelsToConfigurations[labelAndConfigurations.Label][configuration] = struct{}{}
+		}
+	}
+
+	labels := make([]gazelle_label.Label, 0, len(labelsToConfigurations))
+	for lbl := range labelsToConfigurations {
+		labels = append(labels, lbl)
+	}
+	sort.Slice(labels, func(i, j int) bool {
+		return CompareLabels(labels[i], labels[j])
+	})
+
+	canonicalized := make([]LabelAndConfigurations, 0, len(labels))
+	for _, lbl := range labels {
+		configurations := make([]Configuration, 0, len(labelsToConfigurations[lbl]))
+		for configuration := range labelsToConfigurations[lbl] {
+			configurations = append(configurations, configuration)
+		}
+		sort.Slice(configurations, func(i, j int) bool {
+			return ConfigurationLess(configurations[i], configurations[j])
+		})
+		canonicalized = append(canonicalized, LabelAndConfigurations{
+			Label:          lbl,
+			Configurations: configurations,
+		})
+	}
+	return canonicalized
 }
 
 type fileHashCache struct {
