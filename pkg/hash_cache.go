@@ -610,7 +610,7 @@ func hashRule(thc *TargetHashCache, rule *build.Rule, configuration *analysis.Co
 	for _, attr := range sortedAttributesForHashing(rule.GetAttribute()) {
 		normalizedAttribute := thc.AttributeForSerialization(attr)
 
-		protoBytes, err := proto.Marshal(normalizedAttribute)
+		protoBytes, err := proto.MarshalOptions{Deterministic: true}.Marshal(normalizedAttribute)
 		if err != nil {
 			return nil, err
 		}
