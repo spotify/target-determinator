@@ -569,7 +569,12 @@ func hashTarget(thc *TargetHashCache, labelAndConfiguration LabelAndConfiguratio
 			return nil, fmt.Errorf("failed to hash file %v: %w", absolutePath, err)
 		}
 		if thc.HashDebug {
-			log.Printf("hash-debug: source_file %s path=%s hash=%x", label, absolutePath, hash)
+			fileInfo, _ := os.Stat(absolutePath)
+			var mode os.FileMode
+			if fileInfo != nil {
+				mode = fileInfo.Mode()
+			}
+			log.Printf("hash-debug: source_file %s path=%s mode=%o exec=%s hash=%x", label, absolutePath, mode, getUserExecuteBit(mode).String(), hash)
 		}
 		return hash, nil
 	case build.Target_RULE:
