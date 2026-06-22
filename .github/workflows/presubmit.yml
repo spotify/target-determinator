@@ -9,8 +9,8 @@ jobs:
     strategy:
       matrix:
         bazel:
-          - 7.*
           - 8.*
+          - 9.*
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
