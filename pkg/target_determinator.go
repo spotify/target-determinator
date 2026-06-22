@@ -158,6 +158,8 @@ type Context struct {
 	// that the loading phase doesn't see (e.g., a sub-module MODULE.bazel referenced via
 	// local_path_override that pins a toolchain version).
 	RuleClassFingerprints []RuleClassFingerprint
+	// HashDebug enables per-target hash component logging for debugging non-deterministic hashes.
+	HashDebug bool `results_cache_key_ignore:"true"`
 }
 
 // RuleClassFingerprint associates a set of rule-class globs with a set of files whose hashed
@@ -332,6 +334,7 @@ func fullyProcessRevision(context *Context, rev LabelledGitRev, targets TargetsL
 		return queryInfo, fmt.Errorf("failed to load metadata at %s: %w", rev, err)
 	}
 
+	queryInfo.TargetHashCache.HashDebug = context.HashDebug
 	log.Println("Hashing targets")
 	if err := queryInfo.PrefillCache(); err != nil {
 		return nil, fmt.Errorf("failed to calculate hashes at %s: %w", rev, err)
