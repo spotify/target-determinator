@@ -107,6 +107,9 @@ type TargetHashCache struct {
 	cache     map[gazelle_label.Label]map[Configuration]*cacheEntry
 
 	ruleClassFingerprints []RuleClassFingerprintDigests
+
+	// HashDebug, when true, logs per-component hash contributions for each target.
+	HashDebug bool
 }
 
 var labelNotFound = fmt.Errorf("label not found in context")
@@ -544,6 +547,9 @@ func hashTarget(thc *TargetHashCache, labelAndConfiguration LabelAndConfiguratio
 			// to be input files, even if no such file exists.
 			// https://github.com/bazelbuild/bazel/issues/14611
 			if os.IsNotExist(err) {
+				if thc.HashDebug {
+					log.Printf("hash-debug: source_file %s path=%s NOT_FOUND", label, absolutePath)
+				}
 				return make([]byte, 0), nil
 			}
 
@@ -555,9 +561,15 @@ func hashTarget(thc *TargetHashCache, labelAndConfiguration LabelAndConfiguratio
 			// We may want to do something more structured here at some point.
 			// See https://github.com/bazelbuild/bazel/issues/14678
 			if strings.Contains(err.Error(), "is a directory") {
+				if thc.HashDebug {
+					log.Printf("hash-debug: source_file %s path=%s IS_DIR", label, absolutePath)
+				}
 				return make([]byte, 0), nil
 			}
 			return nil, fmt.Errorf("failed to hash file %v: %w", absolutePath, err)
+		}
+		if thc.HashDebug {
+			log.Printf("hash-debug: source_file %s path=%s hash=%x", label, absolutePath, hash)
 		}
 		return hash, nil
 	case build.Target_RULE:
@@ -655,10 +667,19 @@ func hashRule(thc *TargetHashCache, rule *build.Rule, configuration *analysis.Co
 			writeLabel(hasher, ruleInputLabel)
 			hasher.Write(ruleInputConfiguration.ForHashing())
 			hasher.Write(ruleInputHash)
+
+			if thc.HashDebug {
+				log.Printf("hash-debug: rule_input %s -> %s config=%s input_hash=%x", rule.GetName(), ruleInputLabel, ruleInputConfiguration, ruleInputHash)
+			}
 		}
 	}
 
-	return hasher.Sum(nil), nil
+	result := hasher.Sum(nil)
+	if thc.HashDebug {
+		log.Printf("hash-debug: rule %s class=%s skylark=%s config=%s final_hash=%x",
+			rule.GetName(), rule.GetRuleClass(), rule.GetSkylarkEnvironmentHashCode(), configuration.GetChecksum(), result)
+	}
+	return result, nil
 }
 
 func sortedAttributesForHashing(attributes []*build.Attribute) []*build.Attribute {
