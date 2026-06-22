@@ -438,6 +438,47 @@ func TestCanonicalizeRuleInputs(t *testing.T) {
 	}
 }
 
+func TestSortedAttributesForHashing(t *testing.T) {
+	attributes := []*build.Attribute{
+		{Name: proto.String("z_attr")},
+		{Name: proto.String("a_attr")},
+		{Name: proto.String("m_attr")},
+	}
+
+	got := sortedAttributesForHashing(attributes)
+	gotNames := []string{got[0].GetName(), got[1].GetName(), got[2].GetName()}
+	wantNames := []string{"a_attr", "m_attr", "z_attr"}
+	if !reflect.DeepEqual(gotNames, wantNames) {
+		t.Fatalf("sortedAttributesForHashing names: got %v want %v", gotNames, wantNames)
+	}
+
+	originalNames := []string{attributes[0].GetName(), attributes[1].GetName(), attributes[2].GetName()}
+	if !reflect.DeepEqual(originalNames, []string{"z_attr", "a_attr", "m_attr"}) {
+		t.Fatalf("sortedAttributesForHashing mutated input: %v", originalNames)
+	}
+}
+
+func TestCanonicalizeRuleInputs(t *testing.T) {
+	labelA := mustParseLabel("//pkg:a")
+	labelB := mustParseLabel("//pkg:b")
+	configA := NormalizeConfiguration("a")
+	configB := NormalizeConfiguration("b")
+
+	got := canonicalizeRuleInputs([]LabelAndConfigurations{
+		{Label: labelB, Configurations: []Configuration{configB, configA}},
+		{Label: labelA, Configurations: []Configuration{configB}},
+		{Label: labelB, Configurations: []Configuration{configA}},
+	})
+	want := []LabelAndConfigurations{
+		{Label: labelA, Configurations: []Configuration{configB}},
+		{Label: labelB, Configurations: []Configuration{configA, configB}},
+	}
+
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("canonicalizeRuleInputs: got %#v want %#v", got, want)
+	}
+}
+
 func areHashesEqual(left, right []byte) bool {
 	return reflect.DeepEqual(left, right)
 }
