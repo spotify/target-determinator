@@ -72,6 +72,7 @@ func main() {
 		log.Fatalf("Failed to load metadata for commit %s: %v", config.CommitSha, err)
 	}
 
+	queryResults.TargetHashCache.HashDebug = config.Context.HashDebug
 	log.Println("Computing target hashes")
 	if err := queryResults.PrefillCache(); err != nil {
 		log.Fatalf("Failed to compute hashes for commit %s: %v", config.CommitSha, err)
@@ -153,6 +154,7 @@ func resolveConfig(flags hashPersisterFlags) (*config, error) {
 		EnforceCleanRepo:                       flags.commonFlags.EnforceCleanRepo == cli.EnforceClean,
 		QueryBackend:                           *flags.commonFlags.QueryBackend,
 		RuleClassFingerprints:                  []pkg.RuleClassFingerprint(*flags.commonFlags.RuleClassFingerprints),
+		HashDebug:                              flags.commonFlags.HashDebug,
 	}
 
 	targetsList, err := pkg.ParseTargetsList(*flags.commonFlags.TargetsFlag)

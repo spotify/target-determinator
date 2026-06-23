@@ -128,6 +128,7 @@ type CommonFlags struct {
 	NoCacheResults                         bool
 	QueryBackend                           *string
 	RuleClassFingerprints                  *RuleClassFingerprintFlag
+	HashDebug                              bool
 }
 
 func StrPtr() *string {
@@ -178,6 +179,7 @@ func RegisterCommonFlags() *CommonFlags {
 	flag.BoolVar(&commonFlags.NoCacheResults, "nocache_results", false, "Disable loading and saving of results to the cache.")
 	flag.StringVar(commonFlags.QueryBackend, "query-backend", "cquery", "Query backend to use for target discovery. Accepted values: cquery, query. 'query' is faster but less precise (no configuration resolution, no select() resolution, no incompatible target filtering).")
 	flag.Var(commonFlags.RuleClassFingerprints, "rule-class-fingerprint", "Mix the content of <file>s into the hash of any target whose rule class matches one of <glob>s. Format: '<glob>[,<glob>...]:<file>[,<file>...]'. Globs use Go path.Match syntax (e.g., 'java_*'). File paths are relative to --working-directory. Repeatable. Useful under --query-backend=query to capture toolchain/module changes that the loading phase doesn't see.")
+	flag.BoolVar(&commonFlags.HashDebug, "hash-debug", false, "Log per-target hash component breakdown (source file paths/hashes, rule input hashes) to stderr for debugging non-deterministic hashes.")
 	return &commonFlags
 }
 
