@@ -65,23 +65,32 @@ func main() {
 
 	log.Printf("Computing hashes for commit %s", config.CommitSha)
 
-	// Process the commit to get query results with computed hashes
+	// Phase 1: Query and parse target metadata
+	phaseStart := time.Now()
 	queryResults, cleanup, err := pkg.LoadIncompleteMetadata(config.Context, commitRev, config.Targets)
 	defer cleanup()
 	if err != nil {
 		log.Fatalf("Failed to load metadata for commit %s: %v", config.CommitSha, err)
 	}
+	log.Printf("Phase query+parse completed in %v", time.Since(phaseStart))
 
+	// Phase 2: Hash all targets
+	phaseStart = time.Now()
 	queryResults.TargetHashCache.HashDebug = config.Context.HashDebug
 	log.Println("Computing target hashes")
 	if err := queryResults.PrefillCache(); err != nil {
 		log.Fatalf("Failed to compute hashes for commit %s: %v", config.CommitSha, err)
 	}
+	log.Printf("Phase hash completed in %v (%d targets)",
+		time.Since(phaseStart), len(queryResults.MatchingTargets.Labels()))
 
+	// Phase 3: Persist hashes to disk
+	phaseStart = time.Now()
 	log.Printf("Persisting hashes to %s", config.OutputFile)
 	if err := pkg.PersistHashes(config.OutputFile, config.CommitSha, queryResults, config.Context, config.Targets.String()); err != nil {
 		log.Fatalf("Failed to persist hashes: %v", err)
 	}
+	log.Printf("Phase persist completed in %v", time.Since(phaseStart))
 
 	log.Printf("Successfully persisted hashes for %d targets to %s",
 		len(queryResults.MatchingTargets.Labels()), config.OutputFile)
