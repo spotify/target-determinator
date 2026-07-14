@@ -136,6 +136,24 @@ func PersistHashes(filePath string, gitCommitSha string, queryResults *QueryResu
 	return nil
 }
 
+// WritePersistedData writes a PersistedHashData struct directly to a JSON file.
+// Used by the seeded path which builds PersistedHashData by merging seed and
+// freshly computed data instead of extracting from QueryResults.
+func WritePersistedData(filePath string, data *PersistedHashData) error {
+	file, err := os.Create(filePath)
+	if err != nil {
+		return fmt.Errorf("failed to create hash file %s: %w", filePath, err)
+	}
+	defer file.Close()
+
+	encoder := json.NewEncoder(file)
+	encoder.SetIndent("", "  ")
+	if err := encoder.Encode(data); err != nil {
+		return fmt.Errorf("failed to encode hash data to %s: %w", filePath, err)
+	}
+	return nil
+}
+
 // LoadPersistedHashes loads persisted hash data from a JSON file
 func LoadPersistedHashes(filePath string) (*PersistedHashData, error) {
 	file, err := os.Open(filePath)

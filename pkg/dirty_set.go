@@ -137,6 +137,11 @@ func labelInPackage(label string, pkg string) bool {
 	return labelToPackage(label) == pkg
 }
 
+// LabelInPackageExported is the exported form of labelInPackage.
+func LabelInPackageExported(label string, pkg string) bool {
+	return labelInPackage(label, pkg)
+}
+
 func labelToPackage(label string) string {
 	if idx := strings.Index(label, "//"); idx >= 0 {
 		label = label[idx:]
