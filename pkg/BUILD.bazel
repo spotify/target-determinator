@@ -39,6 +39,7 @@ go_test(
         "hash_cache_test.go",
         "hash_persistence_test.go",
         "normalizer_test.go",
+        "seed_hashes_test.go",
         "target_determinator_test.go",
         "walker_test.go",
     ],

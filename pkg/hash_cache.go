@@ -228,6 +228,34 @@ func (thc *TargetHashCache) RestoreHashes(hashes map[string][]byte) error {
 	return nil
 }
 
+// SeedHashes populates the cache with pre-computed hashes WITHOUT freezing
+// the cache. This allows further Hash() calls to compute new values for
+// targets not in the seed set. When a dirty target's hash recursion reaches
+// a seeded entry, it terminates immediately with the seeded value.
+// Keys must be formatted as "<label>\x00<configuration>".
+func (thc *TargetHashCache) SeedHashes(hashes map[string][]byte) error {
+	thc.cacheLock.Lock()
+	defer thc.cacheLock.Unlock()
+	for key, hash := range hashes {
+		idx := strings.IndexByte(key, '\x00')
+		if idx < 0 {
+			return fmt.Errorf("invalid hash key %q: missing separator", key)
+		}
+		lbl, err := thc.ParseCanonicalLabel(key[:idx])
+		if err != nil {
+			return fmt.Errorf("failed to parse label %q from hash cache: %w", key[:idx], err)
+		}
+		cfg := NormalizeConfiguration(key[idx+1:])
+		if thc.cache[lbl] == nil {
+			thc.cache[lbl] = make(map[Configuration]*cacheEntry)
+		}
+		hashCopy := make([]byte, len(hash))
+		copy(hashCopy, hash)
+		thc.cache[lbl][cfg] = &cacheEntry{hash: hashCopy}
+	}
+	return nil
+}
+
 func (thc *TargetHashCache) ParseCanonicalLabel(label string) (gazelle_label.Label, error) {
 	return thc.normalizer.ParseCanonicalLabel(label)
 }
