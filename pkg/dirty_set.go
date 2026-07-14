@@ -12,12 +12,15 @@ type DirtySetResult struct {
 	DirtyLabels map[string]bool
 	// DirtyStarLabels is DirtyLabels plus all transitive reverse deps.
 	DirtyStarLabels map[string]bool
-	// NeedsFallback is true when a change requires full rehash.
+	// DirtyPackages is the sorted list of packages containing changed files
+	// (source or BUILD). Targets in these packages must be re-listed with a
+	// package wildcard (e.g. //pkg:all) rather than by explicit label, so
+	// that targets added to or removed from the package are handled.
+	DirtyPackages []string
+	// NeedsFallback is true when a change requires a full rehash.
 	NeedsFallback bool
 	// FallbackReason describes why a fallback was triggered.
 	FallbackReason string
-	// DeletedPackages lists packages whose BUILD files were deleted.
-	DeletedPackages []string
 }
 
 // ComputeDirtySet determines which targets need rehashing based on changed
@@ -28,10 +31,24 @@ type DirtySetResult struct {
 // edges maps target labels to their direct dependency labels (from the seed
 // file's TargetEdges).
 // allLabels is the complete set of labels known to the seed file (union of
-// TargetEdges keys and values, plus TargetHashes keys). Used to find source
-// file labels in packages with changed files.
+// TargetEdges keys and values, plus TargetHashes keys). Used both to find
+// labels in dirty packages and to derive the set of known packages.
 // ruleClassFingerprintFiles is the set of workspace-relative paths used for
 // rule-class fingerprints; a change to any of these triggers a fallback.
+//
+// A changed source file is attributed to its owning package by walking up
+// the directory tree to the nearest package known to the seed. This mirrors
+// how Bazel assigns files to packages: globs cannot cross package
+// boundaries, and a label //pkg:path/file requires pkg to be a package, so
+// the nearest enclosing package is the only one whose targets can reference
+// the file. Files with no enclosing known package cannot be inputs to any
+// seeded target and are ignored.
+//
+// Fallback (full rehash) is triggered by: .bzl files, MODULE.bazel and
+// *.MODULE.bazel, .bazelrc, .bazelversion, .bazelignore, rule-class
+// fingerprint files, deleted or renamed BUILD files (deleted/renamed
+// packages), and BUILD files for packages unknown to the seed (new
+// packages, which may also re-partition the parent package's files).
 func ComputeDirtySet(
 	changedFiles map[string]string,
 	edges map[string][]string,
@@ -43,7 +60,13 @@ func ComputeDirtySet(
 		DirtyStarLabels: make(map[string]bool),
 	}
 
-	for filePath := range changedFiles {
+	knownPackages := make(map[string]bool)
+	for label := range allLabels {
+		knownPackages[labelToPackage(label)] = true
+	}
+
+	// First pass: fallback triggers.
+	for filePath, status := range changedFiles {
 		base := filepath.Base(filePath)
 
 		if ruleClassFingerprintFiles[filePath] {
@@ -57,34 +80,62 @@ func ComputeDirtySet(
 			result.FallbackReason = "fallback trigger file changed: " + filePath
 			return result
 		}
-	}
 
-	for filePath, status := range changedFiles {
-		base := filepath.Base(filePath)
-
-		if (base == "BUILD" || base == "BUILD.bazel") && (status == "D" || status == "R") {
-			pkg := fileToPackage(filePath)
-			result.DeletedPackages = append(result.DeletedPackages, pkg)
-		}
-
-		pkg := fileToPackage(filePath)
-		for label := range allLabels {
-			if labelInPackage(label, pkg) {
-				result.DirtyLabels[label] = true
+		if base == "BUILD" || base == "BUILD.bazel" {
+			if status == "D" || strings.HasPrefix(status, "R") {
+				result.NeedsFallback = true
+				result.FallbackReason = "package deleted or renamed: " + filePath
+				return result
+			}
+			if !knownPackages[fileToPackage(filePath)] {
+				result.NeedsFallback = true
+				result.FallbackReason = "BUILD file for package unknown to seed: " + filePath
+				return result
 			}
 		}
 	}
 
-	sort.Strings(result.DeletedPackages)
+	// Second pass: map changed files to dirty packages and labels.
+	dirtyPackages := make(map[string]bool)
+	for filePath := range changedFiles {
+		base := filepath.Base(filePath)
 
-	rdeps := BuildRdeps(edges)
+		var pkg string
+		if base == "BUILD" || base == "BUILD.bazel" {
+			// A BUILD file change dirties its own package (verified known above).
+			pkg = fileToPackage(filePath)
+		} else {
+			// A source file belongs to the nearest enclosing known package.
+			owner, ok := owningPackage(filePath, knownPackages)
+			if !ok {
+				// No enclosing package: the file cannot be an input to any
+				// seeded target (see function comment).
+				continue
+			}
+			pkg = owner
+		}
 
-	for label := range result.DirtyLabels {
-		result.DirtyStarLabels[label] = true
+		if !dirtyPackages[pkg] {
+			dirtyPackages[pkg] = true
+			for label := range allLabels {
+				if labelInPackage(label, pkg) {
+					result.DirtyLabels[label] = true
+				}
+			}
+		}
 	}
+
+	for pkg := range dirtyPackages {
+		result.DirtyPackages = append(result.DirtyPackages, pkg)
+	}
+	sort.Strings(result.DirtyPackages)
+
+	// Propagate dirtiness through reverse deps.
+	rdeps := BuildRdeps(edges)
 
 	queue := make([]string, 0, len(result.DirtyLabels))
 	for label := range result.DirtyLabels {
+		result.DirtyStarLabels[label] = true
 		queue = append(queue, label)
 	}
 
@@ -96,14 +147,6 @@ func ComputeDirtySet(
 			if !result.DirtyStarLabels[rdep] {
 				result.DirtyStarLabels[rdep] = true
 				queue = append(queue, rdep)
-			}
-		}
-	}
-
-	for _, pkg := range result.DeletedPackages {
-		for label := range allLabels {
-			if labelInPackage(label, pkg) {
-				result.DirtyStarLabels[label] = true
 			}
 		}
 	}
@@ -133,13 +176,39 @@ func fileToPackage(filePath string) string {
 	return "//" + filepath.ToSlash(dir)
 }
 
+// owningPackage walks up the directory tree from filePath and returns the
+// nearest enclosing package present in knownPackages.
+func owningPackage(filePath string, knownPackages map[string]bool) (string, bool) {
+	dir := filepath.ToSlash(filepath.Dir(filePath))
+	for {
+		var pkg string
+		if dir == "." || dir == "/" || dir == "" {
+			pkg = "//"
+		} else {
+			pkg = "//" + dir
+		}
+		if knownPackages[pkg] {
+			return pkg, true
+		}
+		if pkg == "//" {
+			return "", false
+		}
+		parent := filepath.ToSlash(filepath.Dir(dir))
+		if parent == dir {
+			return "", false
+		}
+		dir = parent
+	}
+}
+
 func labelInPackage(label string, pkg string) bool {
 	return labelToPackage(label) == pkg
 }
 
-// LabelInPackageExported is the exported form of labelInPackage.
-func LabelInPackageExported(label string, pkg string) bool {
-	return labelInPackage(label, pkg)
+// LabelPackage returns the package portion of a label, e.g. "//foo/bar" for
+// "//foo/bar:baz". Repository prefixes are stripped.
+func LabelPackage(label string) string {
+	return labelToPackage(label)
 }
 
 func labelToPackage(label string) string {

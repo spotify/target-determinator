@@ -1,55 +1,64 @@
 package pkg
 
 import (
-	"os"
-	"strings"
 	"testing"
 )
 
-func TestBuildScopedPatternEmpty(t *testing.T) {
-	got := BuildScopedPattern(nil)
+func TestBuildScopedUniverseEmpty(t *testing.T) {
+	got := BuildScopedUniverse(nil, nil)
 	if got != "set()" {
-		t.Errorf("empty labels: want %q, got %q", "set()", got)
+		t.Errorf("empty universe: want %q, got %q", "set()", got)
 	}
 }
 
-func TestBuildScopedPatternSorted(t *testing.T) {
-	got := BuildScopedPattern([]string{"//z:z", "//a:a", "//m:m"})
-	want := "set(//a:a //m:m //z:z)"
+func TestBuildScopedUniversePackagesOnly(t *testing.T) {
+	got := BuildScopedUniverse([]string{"//a", "//b/c"}, nil)
+	want := "(//a:all + //b/c:all)"
 	if got != want {
 		t.Errorf("want %q, got %q", want, got)
 	}
 }
 
-func TestBuildScopedPatternSingle(t *testing.T) {
-	got := BuildScopedPattern([]string{"//foo:bar"})
-	want := "set(//foo:bar)"
+func TestBuildScopedUniverseLabelsOnly(t *testing.T) {
+	got := BuildScopedUniverse(nil, []string{"//z:z", "//a:a"})
+	want := "(set(//a:a //z:z))"
 	if got != want {
 		t.Errorf("want %q, got %q", want, got)
 	}
 }
 
-func TestWriteScopedQueryFile(t *testing.T) {
-	path, err := WriteScopedQueryFile([]string{"//b:b", "//a:a"})
-	if err != nil {
-		t.Fatalf("WriteScopedQueryFile: %v", err)
-	}
-	defer os.Remove(path)
-
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("read query file: %v", err)
-	}
-
-	content := string(data)
-	if !strings.Contains(content, "deps(set(//a:a //b:b))") {
-		t.Errorf("expected sorted deps(set(...)), got %q", content)
+func TestBuildScopedUniversePackagesAndLabels(t *testing.T) {
+	got := BuildScopedUniverse([]string{"//pkg"}, []string{"//app:binary"})
+	want := "(//pkg:all + set(//app:binary))"
+	if got != want {
+		t.Errorf("want %q, got %q", want, got)
 	}
 }
 
-func TestWriteScopedQueryFileEmpty(t *testing.T) {
-	_, err := WriteScopedQueryFile(nil)
-	if err == nil {
-		t.Fatal("expected error for empty labels")
+func TestScopeTargetsPatternPlain(t *testing.T) {
+	got, err := ScopeTargetsPattern("//...", "(//pkg:all)")
+	if err != nil {
+		t.Fatalf("ScopeTargetsPattern: %v", err)
+	}
+	if got != "(//pkg:all)" {
+		t.Errorf("want %q, got %q", "(//pkg:all)", got)
+	}
+}
+
+func TestScopeTargetsPatternManualFilter(t *testing.T) {
+	original := `//... - attr(tags, "manual", //...)`
+	got, err := ScopeTargetsPattern(original, "(//pkg:all + set(//app:binary))")
+	if err != nil {
+		t.Fatalf("ScopeTargetsPattern: %v", err)
+	}
+	want := `(//pkg:all + set(//app:binary)) - attr(tags, "manual", (//pkg:all + set(//app:binary)))`
+	if got != want {
+		t.Errorf("want %q, got %q", want, got)
+	}
+}
+
+func TestScopeTargetsPatternNoWildcard(t *testing.T) {
+	if _, err := ScopeTargetsPattern("//app:binary", "(//pkg:all)"); err == nil {
+		t.Fatal("expected error for pattern without //...")
 	}
 }

@@ -104,11 +104,11 @@ func TestComputeDirtySetSubModuleBazelFallback(t *testing.T) {
 	}
 }
 
-func TestComputeDirtySetDeletedBUILD(t *testing.T) {
+func TestComputeDirtySetDeletedBUILDFallsBack(t *testing.T) {
 	edges := map[string][]string{
 		"//deleted_pkg:target": {"//lib:dep"},
-		"//app:binary":        {"//deleted_pkg:target"},
-		"//lib:dep":           {},
+		"//app:binary":         {"//deleted_pkg:target"},
+		"//lib:dep":            {},
 	}
 	allLabels := CollectAllLabels(edges, nil)
 
@@ -118,17 +118,94 @@ func TestComputeDirtySetDeletedBUILD(t *testing.T) {
 
 	result := ComputeDirtySet(changedFiles, edges, allLabels, nil)
 
+	if !result.NeedsFallback {
+		t.Fatal("expected fallback for deleted BUILD file")
+	}
+}
+
+func TestComputeDirtySetRenamedBUILDFallsBack(t *testing.T) {
+	edges := map[string][]string{
+		"//pkg:target": {},
+	}
+	allLabels := CollectAllLabels(edges, nil)
+
+	changedFiles := map[string]string{
+		"pkg/BUILD.bazel": "R100",
+	}
+
+	result := ComputeDirtySet(changedFiles, edges, allLabels, nil)
+
+	if !result.NeedsFallback {
+		t.Fatal("expected fallback for renamed BUILD file")
+	}
+}
+
+func TestComputeDirtySetNewPackageFallsBack(t *testing.T) {
+	edges := map[string][]string{
+		"//pkg:target": {},
+	}
+	allLabels := CollectAllLabels(edges, nil)
+
+	changedFiles := map[string]string{
+		"newpkg/BUILD.bazel": "A",
+	}
+
+	result := ComputeDirtySet(changedFiles, edges, allLabels, nil)
+
+	if !result.NeedsFallback {
+		t.Fatal("expected fallback for BUILD file of package unknown to seed")
+	}
+}
+
+func TestComputeDirtySetOwningPackageWalkUp(t *testing.T) {
+	// The file lives several directories below the package's BUILD file, as
+	// is typical for Maven-layout Java packages.
+	edges := map[string][]string{
+		"//svc:lib":    {"//svc:src/main/java/App.java"},
+		"//app:binary": {"//svc:lib"},
+	}
+	allLabels := CollectAllLabels(edges, nil)
+
+	changedFiles := map[string]string{
+		"svc/src/main/java/App.java": "M",
+	}
+
+	result := ComputeDirtySet(changedFiles, edges, allLabels, nil)
+
 	if result.NeedsFallback {
-		t.Fatal("unexpected fallback")
+		t.Fatalf("unexpected fallback: %s", result.FallbackReason)
 	}
-	if len(result.DeletedPackages) != 1 || result.DeletedPackages[0] != "//deleted_pkg" {
-		t.Errorf("expected DeletedPackages=[//deleted_pkg], got %v", result.DeletedPackages)
-	}
-	if !result.DirtyStarLabels["//deleted_pkg:target"] {
-		t.Error("deleted package targets should be in DirtyStarLabels")
+	if !result.DirtyLabels["//svc:lib"] {
+		t.Error("expected //svc:lib dirty via owning-package walk-up")
 	}
 	if !result.DirtyStarLabels["//app:binary"] {
-		t.Error("rdep of deleted target should be in DirtyStarLabels")
+		t.Error("expected //app:binary in DirtyStarLabels")
+	}
+	if len(result.DirtyPackages) != 1 || result.DirtyPackages[0] != "//svc" {
+		t.Errorf("expected DirtyPackages=[//svc], got %v", result.DirtyPackages)
+	}
+}
+
+func TestComputeDirtySetUnownedFileIgnored(t *testing.T) {
+	edges := map[string][]string{
+		"//pkg:target": {},
+	}
+	allLabels := CollectAllLabels(edges, nil)
+
+	changedFiles := map[string]string{
+		"docs/README.md": "M",
+	}
+
+	result := ComputeDirtySet(changedFiles, edges, allLabels, nil)
+
+	if result.NeedsFallback {
+		t.Fatalf("unexpected fallback: %s", result.FallbackReason)
+	}
+	if len(result.DirtyLabels) != 0 {
+		t.Errorf("expected no dirty labels for unowned file, got %v", result.DirtyLabels)
+	}
+	if len(result.DirtyPackages) != 0 {
+		t.Errorf("expected no dirty packages for unowned file, got %v", result.DirtyPackages)
 	}
 }
 

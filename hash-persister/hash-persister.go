@@ -141,12 +141,6 @@ func runSeeded(cfg *config) {
 	}
 	log.Printf("Git diff: %d changed files in %v", len(changedFiles), time.Since(phaseStart))
 
-	if len(changedFiles) == 0 {
-		log.Printf("No files changed; copying seed file as output")
-		copyFile(cfg.SeedFile, cfg.OutputFile)
-		return
-	}
-
 	fingerprintFiles := make(map[string]bool)
 	for _, fp := range cfg.Context.RuleClassFingerprints {
 		for _, f := range fp.Files {
@@ -157,12 +151,52 @@ func runSeeded(cfg *config) {
 	phaseStart = time.Now()
 	allLabels := pkg.CollectAllLabels(seedData.TargetEdges, seedData.TargetHashes)
 	dirtyResult := pkg.ComputeDirtySet(changedFiles, seedData.TargetEdges, allLabels, fingerprintFiles)
-	log.Printf("Dirty set computed in %v: %d dirty, %d dirty* (fallback=%v)",
+	log.Printf("Dirty set computed in %v: %d dirty, %d dirty*, %d dirty packages (fallback=%v)",
 		time.Since(phaseStart), len(dirtyResult.DirtyLabels),
-		len(dirtyResult.DirtyStarLabels), dirtyResult.NeedsFallback)
+		len(dirtyResult.DirtyStarLabels), len(dirtyResult.DirtyPackages),
+		dirtyResult.NeedsFallback)
 
 	if dirtyResult.NeedsFallback {
 		log.Printf("Fallback triggered: %s", dirtyResult.FallbackReason)
+		runFull(cfg)
+		return
+	}
+
+	if len(dirtyResult.DirtyPackages) == 0 && len(dirtyResult.DirtyStarLabels) == 0 {
+		log.Printf("No targets affected; persisting seed hashes under commit %s", cfg.CommitSha)
+		seedData.GitCommitSha = cfg.CommitSha
+		seedData.Timestamp = time.Now()
+		if err := pkg.WritePersistedData(cfg.OutputFile, seedData); err != nil {
+			log.Fatalf("Failed to persist hashes: %v", err)
+		}
+		return
+	}
+
+	// The scoped universe re-lists every dirty package with a wildcard (to
+	// pick up added and deleted targets) and names the rdeps-propagated
+	// targets in unchanged packages explicitly.
+	carriedLabels := make([]string, 0, len(dirtyResult.DirtyStarLabels))
+	dirtyPackageSet := make(map[string]bool, len(dirtyResult.DirtyPackages))
+	for _, p := range dirtyResult.DirtyPackages {
+		dirtyPackageSet[p] = true
+	}
+	for label := range dirtyResult.DirtyStarLabels {
+		// Only carry labels that were matching targets in the seed: labels
+		// that only appear as dependency edges (source files, external or
+		// manual targets) are not part of the persisted target set.
+		if _, ok := seedData.TargetHashes[label]; !ok {
+			continue
+		}
+		if dirtyPackageSet[pkg.LabelPackage(label)] {
+			continue
+		}
+		carriedLabels = append(carriedLabels, label)
+	}
+
+	universe := pkg.BuildScopedUniverse(dirtyResult.DirtyPackages, carriedLabels)
+	scopedPattern, err := pkg.ScopeTargetsPattern(cfg.Targets.String(), universe)
+	if err != nil {
+		log.Printf("Cannot scope targets pattern: %v; falling back to full computation", err)
 		runFull(cfg)
 		return
 	}
@@ -173,12 +207,12 @@ func runSeeded(cfg *config) {
 	}
 
 	phaseStart = time.Now()
-	dirtyLabels := make([]string, 0, len(dirtyResult.DirtyStarLabels))
-	for label := range dirtyResult.DirtyStarLabels {
-		dirtyLabels = append(dirtyLabels, label)
+	scopedTargets, err := pkg.ParseTargetsList(scopedPattern)
+	if err != nil {
+		log.Fatalf("Failed to parse scoped targets: %v", err)
 	}
 
-	queryResults, cleanup, err := pkg.LoadIncompleteMetadataScoped(cfg.Context, commitRev, dirtyLabels)
+	queryResults, cleanup, err := pkg.LoadIncompleteMetadata(cfg.Context, commitRev, scopedTargets)
 	defer cleanup()
 	if err != nil {
 		log.Printf("Scoped query failed: %v; falling back to full computation", err)
@@ -196,8 +230,7 @@ func runSeeded(cfg *config) {
 		for configStr, hashHex := range configMap {
 			hashBytes, err := hex.DecodeString(hashHex)
 			if err != nil {
-				log.Printf("Warning: invalid hash hex for %s: %v", label, err)
-				continue
+				log.Fatalf("Invalid hash hex for %s in seed file: %v", label, err)
 			}
 			key := label + "\x00" + configStr
 			seedHashes[key] = hashBytes
@@ -211,12 +244,16 @@ func runSeeded(cfg *config) {
 
 	phaseStart = time.Now()
 	queryResults.TargetHashCache.HashDebug = cfg.Context.HashDebug
-	log.Printf("Computing hashes for %d dirty* targets", len(dirtyResult.DirtyStarLabels))
+	log.Printf("Computing hashes for %d scoped targets", len(queryResults.MatchingTargets.Labels()))
 	if err := queryResults.PrefillCache(); err != nil {
 		log.Fatalf("Failed to compute hashes: %v", err)
 	}
 	log.Printf("Phase hash completed in %v", time.Since(phaseStart))
 
+	// Merge: seed entries for unaffected targets + freshly computed entries
+	// for the scoped matching set. Targets deleted from dirty packages are in
+	// dirty* (dropped from the seed) and absent from the scoped matching set,
+	// so they fall out of the output naturally.
 	phaseStart = time.Now()
 	mergedHashes := make(map[string]map[string]string)
 
@@ -224,37 +261,41 @@ func runSeeded(cfg *config) {
 		if dirtyResult.DirtyStarLabels[label] {
 			continue
 		}
-		if isInDeletedPackage(label, dirtyResult.DeletedPackages) {
-			continue
-		}
 		mergedHashes[label] = configMap
 	}
 
-	freshHashes := queryResults.TargetHashCache.ExtractHashes()
-	for key, hash := range freshHashes {
-		idx := strings.IndexByte(key, '\x00')
-		if idx < 0 {
-			continue
+	// Only persist hashes for the scoped MATCHING targets, mirroring what
+	// PersistHashes does in full mode. TargetHashCache also holds hashes for
+	// intermediate targets (source files, external deps) which full mode
+	// never persists.
+	for _, label := range queryResults.MatchingTargets.Labels() {
+		labelStr := label.String()
+		for _, configuration := range queryResults.MatchingTargets.ConfigurationsFor(label) {
+			hash, err := queryResults.TargetHashCache.Hash(pkg.LabelAndConfiguration{
+				Label:         label,
+				Configuration: configuration,
+			})
+			if err != nil {
+				log.Fatalf("Failed to get hash for scoped target %s: %v", labelStr, err)
+			}
+			if mergedHashes[labelStr] == nil {
+				mergedHashes[labelStr] = make(map[string]string)
+			}
+			mergedHashes[labelStr][configuration.String()] = hex.EncodeToString(hash)
 		}
-		label := key[:idx]
-		configStr := key[idx+1:]
-		if mergedHashes[label] == nil {
-			mergedHashes[label] = make(map[string]string)
-		}
-		mergedHashes[label][configStr] = hex.EncodeToString(hash)
 	}
 
 	mergedEdges := make(map[string][]string)
 	mergedConfigs := make(map[string]string)
 
 	for label, deps := range seedData.TargetEdges {
-		if dirtyResult.DirtyStarLabels[label] || isInDeletedPackage(label, dirtyResult.DeletedPackages) {
+		if dirtyResult.DirtyStarLabels[label] {
 			continue
 		}
 		mergedEdges[label] = deps
 	}
 	for label, c := range seedData.TargetConfigurations {
-		if dirtyResult.DirtyStarLabels[label] || isInDeletedPackage(label, dirtyResult.DeletedPackages) {
+		if dirtyResult.DirtyStarLabels[label] {
 			continue
 		}
 		mergedConfigs[label] = c
@@ -291,7 +332,7 @@ func runSeeded(cfg *config) {
 	log.Printf("Phase persist+merge completed in %v", time.Since(phaseStart))
 
 	log.Printf("Successfully persisted %d target hashes to %s (seeded mode, %d recomputed)",
-		len(mergedHashes), cfg.OutputFile, len(dirtyResult.DirtyStarLabels))
+		len(mergedHashes), cfg.OutputFile, len(queryResults.MatchingTargets.Labels()))
 }
 
 func runVerifySeed(cfg *config) {
@@ -502,13 +543,4 @@ func countHashes(hashes map[string]map[string]string) int {
 		n += len(configs)
 	}
 	return n
-}
-
-func isInDeletedPackage(label string, deletedPkgs []string) bool {
-	for _, p := range deletedPkgs {
-		if pkg.LabelInPackageExported(label, p) {
-			return true
-		}
-	}
-	return false
 }
