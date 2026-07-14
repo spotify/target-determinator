@@ -8,11 +8,14 @@ import (
 	"sort"
 	"time"
 
+	"github.com/bazel-contrib/target-determinator/third_party/protobuf/bazel/build"
 	gazelle_label "github.com/bazelbuild/bazel-gazelle/label"
 )
 
 // PersistedHashData represents the structure of a persisted hash file
 type PersistedHashData struct {
+	// FormatVersion identifies the persisted format. 0 (absent) = v8; 9 = v9+edges.
+	FormatVersion int `json:"format_version,omitempty"`
 	// GitCommitSha is the git commit SHA this hash data was computed for
 	GitCommitSha string `json:"git_commit_sha"`
 	// Timestamp when the hash was computed
@@ -21,6 +24,14 @@ type PersistedHashData struct {
 	BazelRelease string `json:"bazel_release"`
 	// TargetHashes maps target labels to their configurations and hashes
 	TargetHashes map[string]map[string]string `json:"target_hashes"`
+	// TargetEdges maps each target label to its direct dependency labels.
+	// Present in format_version >= 9. Edges are label-only (configuration-
+	// independent) because CI uses --query-backend=query with a single null
+	// configuration.
+	TargetEdges map[string][]string `json:"target_edges,omitempty"`
+	// TargetConfigurations maps each target label to its configuration checksum.
+	// Present in format_version >= 9.
+	TargetConfigurations map[string]string `json:"target_configurations,omitempty"`
 	// Metadata contains additional information about the computation
 	Metadata HashMetadata `json:"metadata"`
 }
@@ -33,6 +44,35 @@ type HashMetadata struct {
 	WorkspacePath string `json:"workspace_path"`
 	// TotalTargets is the number of targets for which hashes were computed
 	TotalTargets int `json:"total_targets"`
+}
+
+// ExtractEdges extracts direct-dependency edges and configuration info from
+// QueryResults. Edges use label strings as keys and values; configurations
+// map each label to its configuration checksum. Because CI operates in query
+// mode (single null configuration), edges are configuration-independent.
+func ExtractEdges(queryResults *QueryResults) (edges map[string][]string, configs map[string]string) {
+	edges = make(map[string][]string)
+	configs = make(map[string]string)
+
+	for lbl, configMap := range queryResults.TransitiveConfiguredTargets {
+		lblStr := lbl.String()
+		for cfg, ct := range configMap {
+			configs[lblStr] = cfg.String()
+			target := ct.GetTarget()
+			if target.GetType() == build.Target_RULE {
+				rule := target.GetRule()
+				deps := make([]string, 0, len(rule.RuleInput))
+				for _, input := range rule.RuleInput {
+					deps = append(deps, input)
+				}
+				sort.Strings(deps)
+				if len(deps) > 0 {
+					edges[lblStr] = deps
+				}
+			}
+		}
+	}
+	return edges, configs
 }
 
 // PersistHashes saves the computed hashes to a JSON file
@@ -59,11 +99,21 @@ func PersistHashes(filePath string, gitCommitSha string, queryResults *QueryResu
 		}
 	}
 
+	// Extract edges for v9 format
+	var targetEdges map[string][]string
+	var targetConfigurations map[string]string
+	if queryResults.TransitiveConfiguredTargets != nil {
+		targetEdges, targetConfigurations = ExtractEdges(queryResults)
+	}
+
 	persistedData := PersistedHashData{
-		GitCommitSha: gitCommitSha,
-		Timestamp:    time.Now(),
-		BazelRelease: queryResults.BazelRelease,
-		TargetHashes: targetHashes,
+		FormatVersion:        9,
+		GitCommitSha:         gitCommitSha,
+		Timestamp:            time.Now(),
+		BazelRelease:         queryResults.BazelRelease,
+		TargetHashes:         targetHashes,
+		TargetEdges:          targetEdges,
+		TargetConfigurations: targetConfigurations,
 		Metadata: HashMetadata{
 			TargetsPattern: targetsPattern,
 			WorkspacePath:  context.WorkspacePath,

@@ -37,6 +37,7 @@ go_test(
     srcs = [
         "cache_test.go",
         "hash_cache_test.go",
+        "hash_persistence_test.go",
         "normalizer_test.go",
         "target_determinator_test.go",
         "walker_test.go",
