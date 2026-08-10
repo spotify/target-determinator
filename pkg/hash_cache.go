@@ -205,6 +205,17 @@ func (thc *TargetHashCache) ExtractHashes() map[string][]byte {
 // RestoreHashes populates the cache with pre-computed hashes and freezes the cache.
 // Keys must be formatted as "<label>\x00<configuration>".
 func (thc *TargetHashCache) RestoreHashes(hashes map[string][]byte) error {
+	return thc.populateHashes(hashes, true)
+}
+
+// SeedHashes populates the cache with pre-computed hashes without freezing
+// the cache. Hash calls may continue to compute values absent from the seed.
+// Keys must be formatted as "<label>\x00<configuration>".
+func (thc *TargetHashCache) SeedHashes(hashes map[string][]byte) error {
+	return thc.populateHashes(hashes, false)
+}
+
+func (thc *TargetHashCache) populateHashes(hashes map[string][]byte, freeze bool) error {
 	thc.cacheLock.Lock()
 	defer thc.cacheLock.Unlock()
 	for key, hash := range hashes {
@@ -224,7 +235,7 @@ func (thc *TargetHashCache) RestoreHashes(hashes map[string][]byte) error {
 		copy(hashCopy, hash)
 		thc.cache[lbl][cfg] = &cacheEntry{hash: hashCopy}
 	}
-	thc.frozen = true
+	thc.frozen = freeze
 	return nil
 }
 
