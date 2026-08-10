@@ -1,6 +1,8 @@
 package main
 
 import (
+	"encoding/json"
+	"os"
 	"reflect"
 	"strings"
 	"testing"
@@ -18,30 +20,63 @@ func TestValidateSeed(t *testing.T) {
 			"//pkg:target": {"": strings.Repeat("01", 32)},
 		},
 	}
-	if reason := validateSeed(valid, "seed-sha", "fingerprint"); reason != "" {
-		t.Fatalf("valid seed rejected: %s", reason)
+	if reason := validateSeed(valid, "seed-sha", "fingerprint"); reason != nil {
+		t.Fatalf("valid seed rejected: %s", reason.Detail)
 	}
 
-	tests := map[string]func(*pkg.PersistedHashData){
-		"format":      func(data *pkg.PersistedHashData) { data.FormatVersion-- },
-		"commit":      func(data *pkg.PersistedHashData) { data.GitCommitSha = "other" },
-		"fingerprint": func(data *pkg.PersistedHashData) { data.SeedCompatibilityFingerprint = "other" },
-		"edges":       func(data *pkg.PersistedHashData) { data.TargetEdges = nil },
-		"hash encoding": func(data *pkg.PersistedHashData) {
+	tests := map[string]struct {
+		code   string
+		mutate func(*pkg.PersistedHashData)
+	}{
+		"format":      {"seed_format_incompatible", func(data *pkg.PersistedHashData) { data.FormatVersion-- }},
+		"commit":      {"seed_commit_mismatch", func(data *pkg.PersistedHashData) { data.GitCommitSha = "other" }},
+		"fingerprint": {"seed_compatibility_mismatch", func(data *pkg.PersistedHashData) { data.SeedCompatibilityFingerprint = "other" }},
+		"edges":       {"seed_missing_edges", func(data *pkg.PersistedHashData) { data.TargetEdges = nil }},
+		"hash encoding": {"seed_hash_invalid", func(data *pkg.PersistedHashData) {
 			data.TargetHashes = map[string]map[string]string{"//pkg:target": {"": "not-hex"}}
-		},
-		"hash length": func(data *pkg.PersistedHashData) {
+		}},
+		"hash length": {"seed_hash_invalid", func(data *pkg.PersistedHashData) {
 			data.TargetHashes = map[string]map[string]string{"//pkg:target": {"": "01"}}
-		},
+		}},
 	}
-	for name, mutate := range tests {
+	for name, test := range tests {
 		t.Run(name, func(t *testing.T) {
 			changed := *valid
-			mutate(&changed)
-			if reason := validateSeed(&changed, "seed-sha", "fingerprint"); reason == "" {
+			test.mutate(&changed)
+			reason := validateSeed(&changed, "seed-sha", "fingerprint")
+			if reason == nil {
 				t.Fatal("incompatible seed was accepted")
 			}
+			if reason.Code != test.code {
+				t.Fatalf("fallback code = %q, want %q", reason.Code, test.code)
+			}
 		})
+	}
+}
+
+func TestWriteExecutionReport(t *testing.T) {
+	path := t.TempDir() + "/report.json"
+	want := &executionReport{
+		SchemaVersion:         1,
+		RequestedMode:         "incremental",
+		EffectiveMode:         "full",
+		Status:                "success",
+		FallbackCode:          "unsafe_file_change",
+		RecomputedTargetCount: 42,
+	}
+	if err := writeExecutionReport(path, want); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got executionReport
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got != *want {
+		t.Fatalf("execution report = %#v, want %#v", got, *want)
 	}
 }
 

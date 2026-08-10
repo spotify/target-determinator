@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
@@ -27,6 +28,7 @@ type hashPersisterFlags struct {
 	seedFile       string
 	seedSha        string
 	verifySeed     bool
+	reportFile     string
 }
 
 type config struct {
@@ -38,11 +40,40 @@ type config struct {
 	SeedFile       string
 	SeedSha        string
 	VerifySeed     bool
+	ReportFile     string
 }
 
 type seededOutcome struct {
-	UsedSeed       bool
-	FallbackReason string
+	UsedSeed              bool
+	FallbackCode          string
+	FallbackDetail        string
+	ChangedFileCount      int
+	DirtyPackageCount     int
+	DirtyTargetCount      int
+	RecomputedTargetCount int
+	ReusedTargetCount     int
+	TotalTargetCount      int
+}
+
+type fallbackReason struct {
+	Code   string
+	Detail string
+}
+
+type executionReport struct {
+	SchemaVersion         int    `json:"schema_version"`
+	RequestedMode         string `json:"requested_mode"`
+	EffectiveMode         string `json:"effective_mode"`
+	Status                string `json:"status"`
+	FallbackCode          string `json:"fallback_code,omitempty"`
+	FallbackDetail        string `json:"fallback_detail,omitempty"`
+	ErrorDetail           string `json:"error_detail,omitempty"`
+	ChangedFileCount      int    `json:"changed_file_count"`
+	DirtyPackageCount     int    `json:"dirty_package_count"`
+	DirtyTargetCount      int    `json:"dirty_target_count"`
+	RecomputedTargetCount int    `json:"recomputed_target_count"`
+	ReusedTargetCount     int    `json:"reused_target_count"`
+	TotalTargetCount      int    `json:"total_target_count"`
 }
 
 func main() {
@@ -72,6 +103,33 @@ func execute() (returnErr error) {
 		return fmt.Errorf("error during preprocessing: %w", err)
 	}
 
+	report := &executionReport{
+		SchemaVersion: 1,
+		RequestedMode: "full",
+		EffectiveMode: "full",
+	}
+	if cfg.SeedFile != "" {
+		report.RequestedMode = "incremental"
+		report.EffectiveMode = "incremental"
+	}
+	if cfg.VerifySeed {
+		report.RequestedMode = "verify"
+		report.EffectiveMode = "verify"
+	}
+	defer func() {
+		if returnErr != nil {
+			report.Status = "failed"
+			report.ErrorDetail = returnErr.Error()
+		} else {
+			report.Status = "success"
+		}
+		if cfg.ReportFile != "" {
+			if err := writeExecutionReport(cfg.ReportFile, report); err != nil && returnErr == nil {
+				returnErr = err
+			}
+		}
+	}()
+
 	defer func() {
 		innerErr := gitCheckout(cfg.Context.WorkspacePath, cfg.Context.OriginalRevision)
 		if innerErr != nil && returnErr == nil {
@@ -84,17 +142,21 @@ func execute() (returnErr error) {
 	}
 
 	if cfg.SeedFile != "" {
-		_, err := runSeeded(cfg)
+		outcome, err := runSeeded(cfg)
+		applySeededOutcome(report, outcome)
 		return err
 	}
 
-	return runFull(cfg)
+	recomputedTargets, err := runFull(cfg)
+	report.RecomputedTargetCount = recomputedTargets
+	report.TotalTargetCount = recomputedTargets
+	return err
 }
 
-func runFull(cfg *config) error {
+func runFull(cfg *config) (int, error) {
 	commitRev, err := pkg.NewLabelledGitRev(cfg.Context.WorkspacePath, cfg.CommitSha, "commit")
 	if err != nil {
-		return fmt.Errorf("failed to resolve commit %s: %w", cfg.CommitSha, err)
+		return 0, fmt.Errorf("failed to resolve commit %s: %w", cfg.CommitSha, err)
 	}
 
 	log.Printf("Computing hashes for commit %s (full mode)", cfg.CommitSha)
@@ -103,7 +165,7 @@ func runFull(cfg *config) error {
 	queryResults, cleanup, err := pkg.LoadIncompleteMetadata(cfg.Context, commitRev, cfg.Targets)
 	if err != nil {
 		cleanup()
-		return fmt.Errorf("failed to load metadata for commit %s: %w", cfg.CommitSha, err)
+		return 0, fmt.Errorf("failed to load metadata for commit %s: %w", cfg.CommitSha, err)
 	}
 	defer cleanup()
 	log.Printf("Phase query+parse completed in %v", time.Since(phaseStart))
@@ -112,10 +174,11 @@ func runFull(cfg *config) error {
 	queryResults.TargetHashCache.HashDebug = cfg.Context.HashDebug
 	log.Println("Computing target hashes")
 	if err := queryResults.PrefillCache(); err != nil {
-		return fmt.Errorf("failed to compute hashes for commit %s: %w", cfg.CommitSha, err)
+		return 0, fmt.Errorf("failed to compute hashes for commit %s: %w", cfg.CommitSha, err)
 	}
+	targetCount := len(queryResults.MatchingTargets.Labels())
 	log.Printf("Phase hash completed in %v (%d targets)",
-		time.Since(phaseStart), len(queryResults.MatchingTargets.Labels()))
+		time.Since(phaseStart), targetCount)
 
 	phaseStart = time.Now()
 	log.Printf("Persisting hashes to %s", cfg.OutputFile)
@@ -124,26 +187,32 @@ func runFull(cfg *config) error {
 		persist = pkg.PersistSeedableHashes
 	}
 	if err := persist(cfg.OutputFile, cfg.CommitSha, queryResults, cfg.Context, cfg.Targets.String()); err != nil {
-		return fmt.Errorf("failed to persist hashes: %w", err)
+		return 0, fmt.Errorf("failed to persist hashes: %w", err)
 	}
 	log.Printf("Phase persist completed in %v", time.Since(phaseStart))
 
 	log.Printf("Successfully persisted hashes for %d targets to %s",
-		len(queryResults.MatchingTargets.Labels()), cfg.OutputFile)
-	return nil
+		targetCount, cfg.OutputFile)
+	return targetCount, nil
 }
 
 func runSeeded(cfg *config) (seededOutcome, error) {
-	fallback := func(reason string) (seededOutcome, error) {
-		log.Printf("Falling back to full computation: %s", reason)
-		return seededOutcome{FallbackReason: reason}, runFull(cfg)
+	var outcome seededOutcome
+	fallback := func(code, detail string) (seededOutcome, error) {
+		log.Printf("Falling back to full computation [%s]: %s", code, detail)
+		recomputedTargets, err := runFull(cfg)
+		outcome.FallbackCode = code
+		outcome.FallbackDetail = detail
+		outcome.RecomputedTargetCount = recomputedTargets
+		outcome.TotalTargetCount = recomputedTargets
+		return outcome, err
 	}
 	log.Printf("Computing hashes for commit %s (seeded from %s)", cfg.CommitSha, cfg.SeedSha)
 
 	phaseStart := time.Now()
 	seedData, err := pkg.LoadPersistedHashes(cfg.SeedFile)
 	if err != nil {
-		return fallback(fmt.Sprintf("cannot load seed file %s: %v", cfg.SeedFile, err))
+		return fallback("seed_read_error", fmt.Sprintf("cannot load seed file %s: %v", cfg.SeedFile, err))
 	}
 	log.Printf("Loaded seed file: %d target hashes, %d edges (format v%d) in %v",
 		len(seedData.TargetHashes), len(seedData.TargetEdges), seedData.FormatVersion,
@@ -157,15 +226,16 @@ func runSeeded(cfg *config) (seededOutcome, error) {
 	if err != nil {
 		return seededOutcome{}, err
 	}
-	if reason := validateSeed(seedData, cfg.SeedSha, compatibilityFingerprint); reason != "" {
-		return fallback(reason)
+	if reason := validateSeed(seedData, cfg.SeedSha, compatibilityFingerprint); reason != nil {
+		return fallback(reason.Code, reason.Detail)
 	}
 
 	phaseStart = time.Now()
 	changedFiles, err := gitDiffNameStatus(cfg.Context.WorkspacePath, cfg.SeedSha, cfg.CommitSha)
 	if err != nil {
-		return fallback(fmt.Sprintf("cannot compute git diff: %v", err))
+		return fallback("git_diff_error", fmt.Sprintf("cannot compute git diff: %v", err))
 	}
+	outcome.ChangedFileCount = len(changedFiles)
 	log.Printf("Git diff: %d changed files in %v", len(changedFiles), time.Since(phaseStart))
 
 	fingerprintFiles := make(map[string]bool)
@@ -178,13 +248,19 @@ func runSeeded(cfg *config) (seededOutcome, error) {
 	phaseStart = time.Now()
 	allLabels := pkg.CollectAllLabels(seedData.TargetEdges, seedData.TargetHashes)
 	dirtyResult := pkg.ComputeDirtySet(changedFiles, seedData.TargetEdges, allLabels, fingerprintFiles)
+	outcome.DirtyPackageCount = len(dirtyResult.DirtyPackages)
+	outcome.DirtyTargetCount = len(dirtyResult.DirtyStarLabels)
 	log.Printf("Dirty set computed in %v: %d dirty, %d dirty*, %d dirty packages (fallback=%v)",
 		time.Since(phaseStart), len(dirtyResult.DirtyLabels),
 		len(dirtyResult.DirtyStarLabels), len(dirtyResult.DirtyPackages),
 		dirtyResult.NeedsFallback)
 
 	if dirtyResult.NeedsFallback {
-		return fallback(dirtyResult.FallbackReason)
+		code := dirtyResult.FallbackCode
+		if code == "" {
+			code = "unsafe_file_change"
+		}
+		return fallback(code, dirtyResult.FallbackReason)
 	}
 
 	if len(dirtyResult.DirtyPackages) == 0 && len(dirtyResult.DirtyStarLabels) == 0 {
@@ -194,7 +270,10 @@ func runSeeded(cfg *config) (seededOutcome, error) {
 		if err := pkg.WritePersistedData(cfg.OutputFile, seedData); err != nil {
 			return seededOutcome{}, fmt.Errorf("failed to persist hashes: %w", err)
 		}
-		return seededOutcome{UsedSeed: true}, nil
+		outcome.UsedSeed = true
+		outcome.ReusedTargetCount = len(seedData.TargetHashes)
+		outcome.TotalTargetCount = len(seedData.TargetHashes)
+		return outcome, nil
 	}
 
 	// The scoped universe re-lists every dirty package with a wildcard (to
@@ -221,7 +300,7 @@ func runSeeded(cfg *config) (seededOutcome, error) {
 	universe := pkg.BuildScopedUniverse(dirtyResult.DirtyPackages, carriedLabels)
 	scopedPattern, err := pkg.ScopeTargetsPattern(cfg.Targets.String(), universe)
 	if err != nil {
-		return fallback(fmt.Sprintf("cannot scope targets pattern: %v", err))
+		return fallback("unscopable_target_pattern", fmt.Sprintf("cannot scope targets pattern: %v", err))
 	}
 
 	commitRev, err := pkg.NewLabelledGitRev(cfg.Context.WorkspacePath, cfg.CommitSha, "commit")
@@ -238,11 +317,11 @@ func runSeeded(cfg *config) (seededOutcome, error) {
 	queryResults, cleanup, err := pkg.LoadIncompleteMetadata(cfg.Context, commitRev, scopedTargets)
 	if err != nil {
 		cleanup()
-		return fallback(fmt.Sprintf("scoped query failed: %v", err))
+		return fallback("scoped_query_error", fmt.Sprintf("scoped query failed: %v", err))
 	}
 	if queryResults.BazelRelease != seedData.BazelRelease {
 		cleanup()
-		return fallback(fmt.Sprintf("Bazel release changed from %q to %q", seedData.BazelRelease, queryResults.BazelRelease))
+		return fallback("bazel_release_changed", fmt.Sprintf("Bazel release changed from %q to %q", seedData.BazelRelease, queryResults.BazelRelease))
 	}
 	log.Printf("Phase scoped query+parse completed in %v", time.Since(phaseStart))
 
@@ -250,12 +329,12 @@ func runSeeded(cfg *config) (seededOutcome, error) {
 	seedHashes, err := reusableSeedHashes(seedData, dirtyResult.DirtyStarLabels)
 	if err != nil {
 		cleanup()
-		return fallback(fmt.Sprintf("seed contains invalid hashes: %v", err))
+		return fallback("seed_hash_invalid", fmt.Sprintf("seed contains invalid hashes: %v", err))
 	}
 
 	if err := queryResults.TargetHashCache.SeedHashes(seedHashes); err != nil {
 		cleanup()
-		return fallback(fmt.Sprintf("cannot seed hashes: %v", err))
+		return fallback("seed_population_error", fmt.Sprintf("cannot seed hashes: %v", err))
 	}
 	defer cleanup()
 	log.Printf("Seeded %d unchanged hashes in %v", len(seedHashes), time.Since(phaseStart))
@@ -281,29 +360,33 @@ func runSeeded(cfg *config) (seededOutcome, error) {
 
 	log.Printf("Successfully persisted %d target hashes to %s (seeded mode, %d recomputed)",
 		len(persistedData.TargetHashes), cfg.OutputFile, len(queryResults.MatchingTargets.Labels()))
-	return seededOutcome{UsedSeed: true}, nil
+	outcome.UsedSeed = true
+	outcome.RecomputedTargetCount = len(queryResults.MatchingTargets.Labels())
+	outcome.TotalTargetCount = len(persistedData.TargetHashes)
+	outcome.ReusedTargetCount = outcome.TotalTargetCount - outcome.RecomputedTargetCount
+	return outcome, nil
 }
 
-func validateSeed(seedData *pkg.PersistedHashData, expectedSha, expectedFingerprint string) string {
+func validateSeed(seedData *pkg.PersistedHashData, expectedSha, expectedFingerprint string) *fallbackReason {
 	if seedData.FormatVersion != pkg.CurrentPersistedHashFormatVersion {
-		return fmt.Sprintf("seed format v%d is not supported (need v%d)", seedData.FormatVersion, pkg.CurrentPersistedHashFormatVersion)
+		return &fallbackReason{"seed_format_incompatible", fmt.Sprintf("seed format v%d is not supported (need v%d)", seedData.FormatVersion, pkg.CurrentPersistedHashFormatVersion)}
 	}
 	if seedData.TargetEdges == nil {
-		return "seed has no dependency edges"
+		return &fallbackReason{"seed_missing_edges", "seed has no dependency edges"}
 	}
 	if seedData.GitCommitSha != expectedSha {
-		return fmt.Sprintf("seed commit %q does not match --seed-sha %q", seedData.GitCommitSha, expectedSha)
+		return &fallbackReason{"seed_commit_mismatch", fmt.Sprintf("seed commit %q does not match --seed-sha %q", seedData.GitCommitSha, expectedSha)}
 	}
 	if seedData.SeedCompatibilityFingerprint == "" {
-		return "seed has no compatibility fingerprint"
+		return &fallbackReason{"seed_compatibility_mismatch", "seed has no compatibility fingerprint"}
 	}
 	if seedData.SeedCompatibilityFingerprint != expectedFingerprint {
-		return "seed compatibility fingerprint does not match this invocation"
+		return &fallbackReason{"seed_compatibility_mismatch", "seed compatibility fingerprint does not match this invocation"}
 	}
 	if _, err := reusableSeedHashes(seedData, nil); err != nil {
-		return fmt.Sprintf("seed contains invalid hashes: %v", err)
+		return &fallbackReason{"seed_hash_invalid", fmt.Sprintf("seed contains invalid hashes: %v", err)}
 	}
-	return ""
+	return nil
 }
 
 func reusableSeedHashes(seedData *pkg.PersistedHashData, dirtyLabels map[string]bool) (map[string][]byte, error) {
@@ -420,7 +503,7 @@ func runVerifySeed(cfg *config) error {
 		return err
 	}
 	if !outcome.UsedSeed {
-		return fmt.Errorf("verify-seed did not exercise seeded mode: %s", outcome.FallbackReason)
+		return fmt.Errorf("verify-seed did not exercise seeded mode: %s", outcome.FallbackDetail)
 	}
 
 	fullCfg := *cfg
@@ -428,7 +511,7 @@ func runVerifySeed(cfg *config) error {
 	fullCfg.SeedFile = ""
 	fullCfg.SeedSha = ""
 	fullCfg.VerifySeed = false
-	if err := runFull(&fullCfg); err != nil {
+	if _, err := runFull(&fullCfg); err != nil {
 		return err
 	}
 
@@ -468,6 +551,7 @@ func parseFlags() (*hashPersisterFlags, error) {
 	flag.StringVar(&flags.seedFile, "seed-file", "", "Path to a compatible seed hash file for incremental hashing")
 	flag.StringVar(&flags.seedSha, "seed-sha", "", "Git commit SHA of the seed file (required with --seed-file)")
 	flag.BoolVar(&flags.verifySeed, "verify-seed", false, "Run both seeded and full computation, compare, exit non-zero on divergence")
+	flag.StringVar(&flags.reportFile, "execution-report", "", "Optional path for a machine-readable JSON execution report")
 
 	flag.Parse()
 
@@ -564,7 +648,36 @@ func resolveConfig(flags hashPersisterFlags) (*config, error) {
 		SeedFile:       flags.seedFile,
 		SeedSha:        flags.seedSha,
 		VerifySeed:     flags.verifySeed,
+		ReportFile:     flags.reportFile,
 	}, nil
+}
+
+func applySeededOutcome(report *executionReport, outcome seededOutcome) {
+	if outcome.UsedSeed {
+		report.EffectiveMode = "incremental"
+	} else if outcome.FallbackCode != "" {
+		report.EffectiveMode = "full"
+	}
+	report.FallbackCode = outcome.FallbackCode
+	report.FallbackDetail = outcome.FallbackDetail
+	report.ChangedFileCount = outcome.ChangedFileCount
+	report.DirtyPackageCount = outcome.DirtyPackageCount
+	report.DirtyTargetCount = outcome.DirtyTargetCount
+	report.RecomputedTargetCount = outcome.RecomputedTargetCount
+	report.ReusedTargetCount = outcome.ReusedTargetCount
+	report.TotalTargetCount = outcome.TotalTargetCount
+}
+
+func writeExecutionReport(path string, report *executionReport) error {
+	file, err := os.Create(path)
+	if err != nil {
+		return fmt.Errorf("failed to create execution report %s: %w", path, err)
+	}
+	defer file.Close()
+	if err := json.NewEncoder(file).Encode(report); err != nil {
+		return fmt.Errorf("failed to encode execution report %s: %w", path, err)
+	}
+	return nil
 }
 
 func validateSeedableBackend(seedableOutput bool, queryBackend string) error {
