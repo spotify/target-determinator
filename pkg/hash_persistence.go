@@ -1,6 +1,7 @@
 package pkg
 
 import (
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -8,11 +9,27 @@ import (
 	"sort"
 	"time"
 
+	"github.com/bazel-contrib/target-determinator/third_party/protobuf/bazel/build"
 	gazelle_label "github.com/bazelbuild/bazel-gazelle/label"
+)
+
+const (
+	// CurrentPersistedHashFormatVersion is the first format with dependency
+	// edges and an explicit seed-compatibility fingerprint.
+	CurrentPersistedHashFormatVersion = 9
+	// HashAlgorithmVersion must change whenever target hashing or persisted
+	// dependency semantics change in a way that makes old hashes unsafe to seed.
+	HashAlgorithmVersion = 1
 )
 
 // PersistedHashData represents the structure of a persisted hash file
 type PersistedHashData struct {
+	// FormatVersion identifies the persisted format. 0 (absent) = v8; 9 is
+	// the first format that supports compatible incremental seeding.
+	FormatVersion int `json:"format_version,omitempty"`
+	// SeedCompatibilityFingerprint identifies the non-source inputs and hash
+	// semantics under which this file was produced.
+	SeedCompatibilityFingerprint string `json:"seed_compatibility_fingerprint,omitempty"`
 	// GitCommitSha is the git commit SHA this hash data was computed for
 	GitCommitSha string `json:"git_commit_sha"`
 	// Timestamp when the hash was computed
@@ -21,8 +38,40 @@ type PersistedHashData struct {
 	BazelRelease string `json:"bazel_release"`
 	// TargetHashes maps target labels to their configurations and hashes
 	TargetHashes map[string]map[string]string `json:"target_hashes"`
+	// TargetEdges maps each target label to its direct dependency labels.
+	// Present in format_version >= 9. Edges are label-only (configuration-
+	// independent) because CI uses --query-backend=query with a single null
+	// configuration.
+	TargetEdges map[string][]string `json:"target_edges,omitempty"`
 	// Metadata contains additional information about the computation
 	Metadata HashMetadata `json:"metadata"`
+}
+
+// SeedCompatibility describes every invocation-level input that must remain
+// identical for persisted hashes to be safely reused. Git revision, timestamp,
+// workspace path, and output path are deliberately excluded.
+type SeedCompatibility struct {
+	HashAlgorithmVersion int                    `json:"hash_algorithm_version"`
+	BazelRelease         string                 `json:"bazel_release"`
+	TargetsPattern       string                 `json:"targets_pattern"`
+	Context              map[string]interface{} `json:"context"`
+}
+
+// ComputeSeedCompatibilityFingerprint returns a deterministic identifier for
+// the non-source inputs that affect target discovery or hashing.
+func ComputeSeedCompatibilityFingerprint(context *Context, targetsPattern, bazelRelease string) (string, error) {
+	compatibility := SeedCompatibility{
+		HashAlgorithmVersion: HashAlgorithmVersion,
+		BazelRelease:         bazelRelease,
+		TargetsPattern:       targetsPattern,
+		Context:              collectCacheContextFields(context),
+	}
+	data, err := json.Marshal(compatibility)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal seed compatibility: %w", err)
+	}
+	digest := sha256.Sum256(data)
+	return hex.EncodeToString(digest[:]), nil
 }
 
 // HashMetadata contains metadata about the hash computation
@@ -35,8 +84,66 @@ type HashMetadata struct {
 	TotalTargets int `json:"total_targets"`
 }
 
-// PersistHashes saves the computed hashes to a JSON file
+// ExtractEdges extracts the label-level projection of every direct dependency
+// used by the target hash function. Multiple configurations are unioned,
+// making the graph conservative. Because seeded mode is query-only in normal
+// operation, each label ordinarily has a single null configuration.
+func ExtractEdges(queryResults *QueryResults) (map[string][]string, error) {
+	edgeSets := make(map[string]map[string]struct{})
+	edges := make(map[string][]string)
+
+	for lbl, configMap := range queryResults.TransitiveConfiguredTargets {
+		lblStr := lbl.String()
+		for _, ct := range configMap {
+			target := ct.GetTarget()
+			var dependencyLabels []gazelle_label.Label
+			switch target.GetType() {
+			case build.Target_RULE:
+				var err error
+				dependencyLabels, err = canonicalRuleInputLabels(queryResults.TargetHashCache, target.GetRule())
+				if err != nil {
+					return nil, fmt.Errorf("failed to extract dependencies of %s: %w", lblStr, err)
+				}
+			case build.Target_GENERATED_FILE:
+				generatingRule, err := canonicalGeneratingRuleLabel(queryResults.TargetHashCache, target.GetGeneratedFile())
+				if err != nil {
+					return nil, fmt.Errorf("failed to extract dependencies of %s: %w", lblStr, err)
+				}
+				dependencyLabels = append(dependencyLabels, generatingRule)
+			}
+			if len(dependencyLabels) > 0 {
+				if edgeSets[lblStr] == nil {
+					edgeSets[lblStr] = make(map[string]struct{})
+				}
+				for _, dep := range dependencyLabels {
+					edgeSets[lblStr][dep.String()] = struct{}{}
+				}
+			}
+		}
+	}
+	for lbl, deps := range edgeSets {
+		for dep := range deps {
+			edges[lbl] = append(edges[lbl], dep)
+		}
+		sort.Strings(edges[lbl])
+	}
+	return edges, nil
+}
+
+// PersistHashes saves computed hashes in the legacy format used by existing
+// full-mode callers. Incremental metadata is omitted to preserve artifact size
+// and behavior unless the caller explicitly requests a seedable artifact.
 func PersistHashes(filePath string, gitCommitSha string, queryResults *QueryResults, context *Context, targetsPattern string) error {
+	return persistHashes(filePath, gitCommitSha, queryResults, context, targetsPattern, false)
+}
+
+// PersistSeedableHashes saves computed hashes together with the dependency
+// graph and compatibility fingerprint required by incremental hashing.
+func PersistSeedableHashes(filePath string, gitCommitSha string, queryResults *QueryResults, context *Context, targetsPattern string) error {
+	return persistHashes(filePath, gitCommitSha, queryResults, context, targetsPattern, true)
+}
+
+func persistHashes(filePath string, gitCommitSha string, queryResults *QueryResults, context *Context, targetsPattern string, seedable bool) error {
 	targetHashes := make(map[string]map[string]string)
 	totalTargets := 0
 
@@ -71,6 +178,31 @@ func PersistHashes(filePath string, gitCommitSha string, queryResults *QueryResu
 		},
 	}
 
+	if seedable {
+		targetEdges, err := ExtractEdges(queryResults)
+		if err != nil {
+			return fmt.Errorf("failed to extract target edges: %w", err)
+		}
+		compatibilityFingerprint, err := ComputeSeedCompatibilityFingerprint(context, targetsPattern, queryResults.BazelRelease)
+		if err != nil {
+			return err
+		}
+		persistedData.FormatVersion = CurrentPersistedHashFormatVersion
+		persistedData.SeedCompatibilityFingerprint = compatibilityFingerprint
+		persistedData.TargetEdges = targetEdges
+	}
+
+	return writePersistedData(filePath, &persistedData, !seedable)
+}
+
+// WritePersistedData writes a PersistedHashData struct directly to a JSON file.
+// Used by the seeded path which builds PersistedHashData by merging seed and
+// freshly computed data instead of extracting from QueryResults.
+func WritePersistedData(filePath string, data *PersistedHashData) error {
+	return writePersistedData(filePath, data, false)
+}
+
+func writePersistedData(filePath string, data *PersistedHashData, pretty bool) error {
 	file, err := os.Create(filePath)
 	if err != nil {
 		return fmt.Errorf("failed to create hash file %s: %w", filePath, err)
@@ -78,11 +210,12 @@ func PersistHashes(filePath string, gitCommitSha string, queryResults *QueryResu
 	defer file.Close()
 
 	encoder := json.NewEncoder(file)
-	encoder.SetIndent("", "  ")
-	if err := encoder.Encode(persistedData); err != nil {
+	if pretty {
+		encoder.SetIndent("", "  ")
+	}
+	if err := encoder.Encode(data); err != nil {
 		return fmt.Errorf("failed to encode hash data to %s: %w", filePath, err)
 	}
-
 	return nil
 }
 
