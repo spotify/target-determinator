@@ -4,6 +4,9 @@
 package main
 
 import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"log"
@@ -17,22 +20,42 @@ import (
 )
 
 type hashPersisterFlags struct {
-	commonFlags *cli.CommonFlags
-	commitSha   string
-	outputFile  string
+	commonFlags    *cli.CommonFlags
+	commitSha      string
+	outputFile     string
+	seedableOutput bool
+	seedFile       string
+	seedSha        string
+	verifySeed     bool
 }
 
 type config struct {
-	Context    *pkg.Context
-	CommitSha  string
-	Targets    pkg.TargetsList
-	OutputFile string
+	Context        *pkg.Context
+	CommitSha      string
+	Targets        pkg.TargetsList
+	OutputFile     string
+	SeedableOutput bool
+	SeedFile       string
+	SeedSha        string
+	VerifySeed     bool
+}
+
+type seededOutcome struct {
+	UsedSeed       bool
+	FallbackReason string
 }
 
 func main() {
 	start := time.Now()
-	defer func() { log.Printf("Finished after %v", time.Since(start)) }()
+	err := execute()
+	log.Printf("Finished after %v", time.Since(start))
+	if err != nil {
+		log.Printf("Hash persister failed: %v", err)
+		os.Exit(1)
+	}
+}
 
+func execute() (returnErr error) {
 	flags, err := parseFlags()
 	if err != nil {
 		fmt.Fprintf(flag.CommandLine.Output(), "Failed to parse flags: %v\n", err)
@@ -41,61 +64,422 @@ func main() {
 		fmt.Fprintf(flag.CommandLine.Output(), "Where <git-commit-sha> is the commit SHA to compute and persist hashes for.\n")
 		fmt.Fprintf(flag.CommandLine.Output(), "Optional flags:\n")
 		flag.PrintDefaults()
-		os.Exit(1)
+		return err
 	}
 
-	config, err := resolveConfig(*flags)
+	cfg, err := resolveConfig(*flags)
 	if err != nil {
-		fmt.Println("Hash Persister invocation Error")
-		log.Fatalf("Error during preprocessing: %v", err)
+		return fmt.Errorf("error during preprocessing: %w", err)
 	}
 
 	defer func() {
-		innerErr := gitCheckout(config.Context.WorkspacePath, config.Context.OriginalRevision)
-		if innerErr != nil && err == nil {
-			err = fmt.Errorf("failed to check out original commit during cleanup: %v", innerErr)
+		innerErr := gitCheckout(cfg.Context.WorkspacePath, cfg.Context.OriginalRevision)
+		if innerErr != nil && returnErr == nil {
+			returnErr = fmt.Errorf("failed to check out original commit during cleanup: %w", innerErr)
 		}
 	}()
 
-	// Create LabelledGitRev for the specified commit
-	commitRev, err := pkg.NewLabelledGitRev(config.Context.WorkspacePath, config.CommitSha, "commit")
-	if err != nil {
-		log.Fatalf("Failed to resolve commit %s: %v", config.CommitSha, err)
+	if cfg.VerifySeed && cfg.SeedFile != "" {
+		return runVerifySeed(cfg)
 	}
 
-	log.Printf("Computing hashes for commit %s", config.CommitSha)
+	if cfg.SeedFile != "" {
+		_, err := runSeeded(cfg)
+		return err
+	}
 
-	// Process the commit to get query results with computed hashes
-	queryResults, cleanup, err := pkg.LoadIncompleteMetadata(config.Context, commitRev, config.Targets)
+	return runFull(cfg)
+}
+
+func runFull(cfg *config) error {
+	commitRev, err := pkg.NewLabelledGitRev(cfg.Context.WorkspacePath, cfg.CommitSha, "commit")
+	if err != nil {
+		return fmt.Errorf("failed to resolve commit %s: %w", cfg.CommitSha, err)
+	}
+
+	log.Printf("Computing hashes for commit %s (full mode)", cfg.CommitSha)
+
+	phaseStart := time.Now()
+	queryResults, cleanup, err := pkg.LoadIncompleteMetadata(cfg.Context, commitRev, cfg.Targets)
+	if err != nil {
+		cleanup()
+		return fmt.Errorf("failed to load metadata for commit %s: %w", cfg.CommitSha, err)
+	}
 	defer cleanup()
-	if err != nil {
-		log.Fatalf("Failed to load metadata for commit %s: %v", config.CommitSha, err)
-	}
+	log.Printf("Phase query+parse completed in %v", time.Since(phaseStart))
 
-	queryResults.TargetHashCache.HashDebug = config.Context.HashDebug
+	phaseStart = time.Now()
+	queryResults.TargetHashCache.HashDebug = cfg.Context.HashDebug
 	log.Println("Computing target hashes")
 	if err := queryResults.PrefillCache(); err != nil {
-		log.Fatalf("Failed to compute hashes for commit %s: %v", config.CommitSha, err)
+		return fmt.Errorf("failed to compute hashes for commit %s: %w", cfg.CommitSha, err)
 	}
+	log.Printf("Phase hash completed in %v (%d targets)",
+		time.Since(phaseStart), len(queryResults.MatchingTargets.Labels()))
 
-	log.Printf("Persisting hashes to %s", config.OutputFile)
-	if err := pkg.PersistHashes(config.OutputFile, config.CommitSha, queryResults, config.Context, config.Targets.String()); err != nil {
-		log.Fatalf("Failed to persist hashes: %v", err)
+	phaseStart = time.Now()
+	log.Printf("Persisting hashes to %s", cfg.OutputFile)
+	persist := pkg.PersistHashes
+	if cfg.SeedableOutput {
+		persist = pkg.PersistSeedableHashes
 	}
+	if err := persist(cfg.OutputFile, cfg.CommitSha, queryResults, cfg.Context, cfg.Targets.String()); err != nil {
+		return fmt.Errorf("failed to persist hashes: %w", err)
+	}
+	log.Printf("Phase persist completed in %v", time.Since(phaseStart))
 
 	log.Printf("Successfully persisted hashes for %d targets to %s",
-		len(queryResults.MatchingTargets.Labels()), config.OutputFile)
+		len(queryResults.MatchingTargets.Labels()), cfg.OutputFile)
+	return nil
+}
+
+func runSeeded(cfg *config) (seededOutcome, error) {
+	fallback := func(reason string) (seededOutcome, error) {
+		log.Printf("Falling back to full computation: %s", reason)
+		return seededOutcome{FallbackReason: reason}, runFull(cfg)
+	}
+	log.Printf("Computing hashes for commit %s (seeded from %s)", cfg.CommitSha, cfg.SeedSha)
+
+	phaseStart := time.Now()
+	seedData, err := pkg.LoadPersistedHashes(cfg.SeedFile)
+	if err != nil {
+		return fallback(fmt.Sprintf("cannot load seed file %s: %v", cfg.SeedFile, err))
+	}
+	log.Printf("Loaded seed file: %d target hashes, %d edges (format v%d) in %v",
+		len(seedData.TargetHashes), len(seedData.TargetEdges), seedData.FormatVersion,
+		time.Since(phaseStart))
+
+	currentBazelRelease, err := pkg.BazelRelease(cfg.Context.WorkspacePath, cfg.Context.BazelCmd)
+	if err != nil {
+		return seededOutcome{}, fmt.Errorf("failed to resolve current Bazel release: %w", err)
+	}
+	compatibilityFingerprint, err := pkg.ComputeSeedCompatibilityFingerprint(cfg.Context, cfg.Targets.String(), currentBazelRelease)
+	if err != nil {
+		return seededOutcome{}, err
+	}
+	if reason := validateSeed(seedData, cfg.SeedSha, compatibilityFingerprint); reason != "" {
+		return fallback(reason)
+	}
+
+	phaseStart = time.Now()
+	changedFiles, err := gitDiffNameStatus(cfg.Context.WorkspacePath, cfg.SeedSha, cfg.CommitSha)
+	if err != nil {
+		return fallback(fmt.Sprintf("cannot compute git diff: %v", err))
+	}
+	log.Printf("Git diff: %d changed files in %v", len(changedFiles), time.Since(phaseStart))
+
+	fingerprintFiles := make(map[string]bool)
+	for _, fp := range cfg.Context.RuleClassFingerprints {
+		for _, f := range fp.Files {
+			fingerprintFiles[f] = true
+		}
+	}
+
+	phaseStart = time.Now()
+	allLabels := pkg.CollectAllLabels(seedData.TargetEdges, seedData.TargetHashes)
+	dirtyResult := pkg.ComputeDirtySet(changedFiles, seedData.TargetEdges, allLabels, fingerprintFiles)
+	log.Printf("Dirty set computed in %v: %d dirty, %d dirty*, %d dirty packages (fallback=%v)",
+		time.Since(phaseStart), len(dirtyResult.DirtyLabels),
+		len(dirtyResult.DirtyStarLabels), len(dirtyResult.DirtyPackages),
+		dirtyResult.NeedsFallback)
+
+	if dirtyResult.NeedsFallback {
+		return fallback(dirtyResult.FallbackReason)
+	}
+
+	if len(dirtyResult.DirtyPackages) == 0 && len(dirtyResult.DirtyStarLabels) == 0 {
+		log.Printf("No targets affected; persisting seed hashes under commit %s", cfg.CommitSha)
+		seedData.GitCommitSha = cfg.CommitSha
+		seedData.Timestamp = time.Now()
+		if err := pkg.WritePersistedData(cfg.OutputFile, seedData); err != nil {
+			return seededOutcome{}, fmt.Errorf("failed to persist hashes: %w", err)
+		}
+		return seededOutcome{UsedSeed: true}, nil
+	}
+
+	// The scoped universe re-lists every dirty package with a wildcard (to
+	// pick up added and deleted targets) and names the rdeps-propagated
+	// targets in unchanged packages explicitly.
+	carriedLabels := make([]string, 0, len(dirtyResult.DirtyStarLabels))
+	dirtyPackageSet := make(map[string]bool, len(dirtyResult.DirtyPackages))
+	for _, p := range dirtyResult.DirtyPackages {
+		dirtyPackageSet[p] = true
+	}
+	for label := range dirtyResult.DirtyStarLabels {
+		// Only carry labels that were matching targets in the seed: labels
+		// that only appear as dependency edges (source files, external or
+		// manual targets) are not part of the persisted target set.
+		if _, ok := seedData.TargetHashes[label]; !ok {
+			continue
+		}
+		if dirtyPackageSet[pkg.LabelPackage(label)] {
+			continue
+		}
+		carriedLabels = append(carriedLabels, label)
+	}
+
+	universe := pkg.BuildScopedUniverse(dirtyResult.DirtyPackages, carriedLabels)
+	scopedPattern, err := pkg.ScopeTargetsPattern(cfg.Targets.String(), universe)
+	if err != nil {
+		return fallback(fmt.Sprintf("cannot scope targets pattern: %v", err))
+	}
+
+	commitRev, err := pkg.NewLabelledGitRev(cfg.Context.WorkspacePath, cfg.CommitSha, "commit")
+	if err != nil {
+		return seededOutcome{}, fmt.Errorf("failed to resolve commit %s: %w", cfg.CommitSha, err)
+	}
+
+	phaseStart = time.Now()
+	scopedTargets, err := pkg.ParseTargetsList(scopedPattern)
+	if err != nil {
+		return seededOutcome{}, fmt.Errorf("failed to parse scoped targets: %w", err)
+	}
+
+	queryResults, cleanup, err := pkg.LoadIncompleteMetadata(cfg.Context, commitRev, scopedTargets)
+	if err != nil {
+		cleanup()
+		return fallback(fmt.Sprintf("scoped query failed: %v", err))
+	}
+	if queryResults.BazelRelease != seedData.BazelRelease {
+		cleanup()
+		return fallback(fmt.Sprintf("Bazel release changed from %q to %q", seedData.BazelRelease, queryResults.BazelRelease))
+	}
+	log.Printf("Phase scoped query+parse completed in %v", time.Since(phaseStart))
+
+	phaseStart = time.Now()
+	seedHashes, err := reusableSeedHashes(seedData, dirtyResult.DirtyStarLabels)
+	if err != nil {
+		cleanup()
+		return fallback(fmt.Sprintf("seed contains invalid hashes: %v", err))
+	}
+
+	if err := queryResults.TargetHashCache.SeedHashes(seedHashes); err != nil {
+		cleanup()
+		return fallback(fmt.Sprintf("cannot seed hashes: %v", err))
+	}
+	defer cleanup()
+	log.Printf("Seeded %d unchanged hashes in %v", len(seedHashes), time.Since(phaseStart))
+
+	phaseStart = time.Now()
+	queryResults.TargetHashCache.HashDebug = cfg.Context.HashDebug
+	log.Printf("Computing hashes for %d scoped targets", len(queryResults.MatchingTargets.Labels()))
+	if err := queryResults.PrefillCache(); err != nil {
+		return seededOutcome{}, fmt.Errorf("failed to compute hashes: %w", err)
+	}
+	log.Printf("Phase hash completed in %v", time.Since(phaseStart))
+
+	phaseStart = time.Now()
+	persistedData, err := mergePersistedData(seedData, dirtyResult.DirtyStarLabels, queryResults, cfg, compatibilityFingerprint)
+	if err != nil {
+		return seededOutcome{}, err
+	}
+
+	if err := pkg.WritePersistedData(cfg.OutputFile, persistedData); err != nil {
+		return seededOutcome{}, fmt.Errorf("failed to persist merged hashes: %w", err)
+	}
+	log.Printf("Phase persist+merge completed in %v", time.Since(phaseStart))
+
+	log.Printf("Successfully persisted %d target hashes to %s (seeded mode, %d recomputed)",
+		len(persistedData.TargetHashes), cfg.OutputFile, len(queryResults.MatchingTargets.Labels()))
+	return seededOutcome{UsedSeed: true}, nil
+}
+
+func validateSeed(seedData *pkg.PersistedHashData, expectedSha, expectedFingerprint string) string {
+	if seedData.FormatVersion != pkg.CurrentPersistedHashFormatVersion {
+		return fmt.Sprintf("seed format v%d is not supported (need v%d)", seedData.FormatVersion, pkg.CurrentPersistedHashFormatVersion)
+	}
+	if seedData.TargetEdges == nil {
+		return "seed has no dependency edges"
+	}
+	if seedData.GitCommitSha != expectedSha {
+		return fmt.Sprintf("seed commit %q does not match --seed-sha %q", seedData.GitCommitSha, expectedSha)
+	}
+	if seedData.SeedCompatibilityFingerprint == "" {
+		return "seed has no compatibility fingerprint"
+	}
+	if seedData.SeedCompatibilityFingerprint != expectedFingerprint {
+		return "seed compatibility fingerprint does not match this invocation"
+	}
+	if _, err := reusableSeedHashes(seedData, nil); err != nil {
+		return fmt.Sprintf("seed contains invalid hashes: %v", err)
+	}
+	return ""
+}
+
+func reusableSeedHashes(seedData *pkg.PersistedHashData, dirtyLabels map[string]bool) (map[string][]byte, error) {
+	hashes := make(map[string][]byte)
+	for label, configMap := range seedData.TargetHashes {
+		if dirtyLabels[label] {
+			continue
+		}
+		for configStr, hashHex := range configMap {
+			hashBytes, err := hex.DecodeString(hashHex)
+			if err != nil {
+				return nil, fmt.Errorf("invalid hash hex for %s: %w", label, err)
+			}
+			if len(hashBytes) != sha256.Size {
+				return nil, fmt.Errorf("invalid hash length for %s: got %d bytes, want %d", label, len(hashBytes), sha256.Size)
+			}
+			hashes[label+"\x00"+configStr] = hashBytes
+		}
+	}
+	return hashes, nil
+}
+
+func mergePersistedData(
+	seedData *pkg.PersistedHashData,
+	dirtyLabels map[string]bool,
+	queryResults *pkg.QueryResults,
+	cfg *config,
+	compatibilityFingerprint string,
+) (*pkg.PersistedHashData, error) {
+	// Only persist hashes for scoped matching targets, mirroring full mode.
+	freshHashes := make(map[string]map[string]string)
+	for _, label := range queryResults.MatchingTargets.Labels() {
+		labelStr := label.String()
+		for _, configuration := range queryResults.MatchingTargets.ConfigurationsFor(label) {
+			hash, err := queryResults.TargetHashCache.Hash(pkg.LabelAndConfiguration{
+				Label: label, Configuration: configuration,
+			})
+			if err != nil {
+				return nil, fmt.Errorf("failed to get hash for scoped target %s: %w", labelStr, err)
+			}
+			if freshHashes[labelStr] == nil {
+				freshHashes[labelStr] = make(map[string]string)
+			}
+			freshHashes[labelStr][configuration.String()] = hex.EncodeToString(hash)
+		}
+	}
+	mergedHashes := mergePersistedEntries(seedData.TargetHashes, dirtyLabels, freshHashes)
+
+	freshEdges := make(map[string][]string)
+	if queryResults.TransitiveConfiguredTargets != nil {
+		var err error
+		freshEdges, err = pkg.ExtractEdges(queryResults)
+		if err != nil {
+			return nil, fmt.Errorf("failed to extract fresh edges: %w", err)
+		}
+	}
+	mergedEdges := mergePersistedEntries(seedData.TargetEdges, dirtyLabels, freshEdges)
+
+	return &pkg.PersistedHashData{
+		FormatVersion:                pkg.CurrentPersistedHashFormatVersion,
+		SeedCompatibilityFingerprint: compatibilityFingerprint,
+		GitCommitSha:                 cfg.CommitSha,
+		Timestamp:                    time.Now(),
+		BazelRelease:                 queryResults.BazelRelease,
+		TargetHashes:                 mergedHashes,
+		TargetEdges:                  mergedEdges,
+		Metadata: pkg.HashMetadata{
+			TargetsPattern: cfg.Targets.String(),
+			WorkspacePath:  cfg.Context.WorkspacePath,
+			TotalTargets:   countHashes(mergedHashes),
+		},
+	}, nil
+}
+
+// mergePersistedEntries retains clean seed entries and overlays entries read
+// from the destination revision. A dirty entry absent from fresh is deleted.
+func mergePersistedEntries[V any](seed map[string]V, dirty map[string]bool, fresh map[string]V) map[string]V {
+	merged := make(map[string]V, len(seed)+len(fresh))
+	for label, value := range seed {
+		if !dirty[label] {
+			merged[label] = value
+		}
+	}
+	for label, value := range fresh {
+		merged[label] = value
+	}
+	return merged
+}
+
+func runVerifySeed(cfg *config) error {
+	log.Printf("Verify-seed mode: computing seeded AND full hashes for %s", cfg.CommitSha)
+
+	seededOutput, err := os.CreateTemp("", "td-verify-seeded-*.json")
+	if err != nil {
+		return fmt.Errorf("failed to create temp file for seeded output: %w", err)
+	}
+	seededPath := seededOutput.Name()
+	seededOutput.Close()
+	defer os.Remove(seededPath)
+
+	fullOutput, err := os.CreateTemp("", "td-verify-full-*.json")
+	if err != nil {
+		return fmt.Errorf("failed to create temp file for full output: %w", err)
+	}
+	fullPath := fullOutput.Name()
+	fullOutput.Close()
+	defer os.Remove(fullPath)
+
+	seededCfg := *cfg
+	seededCfg.OutputFile = seededPath
+	seededCfg.VerifySeed = false
+	outcome, err := runSeeded(&seededCfg)
+	if err != nil {
+		return err
+	}
+	if !outcome.UsedSeed {
+		return fmt.Errorf("verify-seed did not exercise seeded mode: %s", outcome.FallbackReason)
+	}
+
+	fullCfg := *cfg
+	fullCfg.OutputFile = fullPath
+	fullCfg.SeedFile = ""
+	fullCfg.SeedSha = ""
+	fullCfg.VerifySeed = false
+	if err := runFull(&fullCfg); err != nil {
+		return err
+	}
+
+	result, err := pkg.CompareHashFiles(fullPath, seededPath)
+	if err != nil {
+		return fmt.Errorf("failed to compare hash files: %w", err)
+	}
+
+	if len(result.Differences) == 0 {
+		log.Printf("VERIFY-SEED: PASS — seeded output matches full computation")
+		return copyFile(fullPath, cfg.OutputFile)
+	} else {
+		log.Printf("VERIFY-SEED: FAIL — %d differences found:", len(result.Differences))
+		log.Printf("  Changed: %d, Added: %d, Removed: %d",
+			result.Summary.TotalChanged, result.Summary.TotalAdded, result.Summary.TotalRemoved)
+		for i, diff := range result.Differences {
+			if i >= 20 {
+				log.Printf("  ... and %d more", len(result.Differences)-20)
+				break
+			}
+			log.Printf("  %s [%s] %s: before=%s after=%s",
+				diff.Label, diff.Configuration, diff.Status,
+				diff.BeforeHash, diff.AfterHash)
+		}
+		if err := copyFile(fullPath, cfg.OutputFile); err != nil {
+			return err
+		}
+		return fmt.Errorf("verify-seed found %d hash differences", len(result.Differences))
+	}
 }
 
 func parseFlags() (*hashPersisterFlags, error) {
 	var flags hashPersisterFlags
 	flags.commonFlags = cli.RegisterCommonFlags()
 	flag.StringVar(&flags.outputFile, "output", "", "Output file path for persisted hashes (required)")
+	flag.BoolVar(&flags.seedableOutput, "seedable-output", false, "Include dependency edges and compatibility metadata so the output can seed incremental hashing")
+	flag.StringVar(&flags.seedFile, "seed-file", "", "Path to a compatible seed hash file for incremental hashing")
+	flag.StringVar(&flags.seedSha, "seed-sha", "", "Git commit SHA of the seed file (required with --seed-file)")
+	flag.BoolVar(&flags.verifySeed, "verify-seed", false, "Run both seeded and full computation, compare, exit non-zero on divergence")
 
 	flag.Parse()
 
 	if flags.outputFile == "" {
 		return nil, fmt.Errorf("output file is required")
+	}
+
+	if flags.seedFile != "" && flags.seedSha == "" {
+		return nil, fmt.Errorf("--seed-sha is required when --seed-file is specified")
+	}
+	if flags.verifySeed && flags.seedFile == "" {
+		return nil, fmt.Errorf("--verify-seed requires --seed-file")
 	}
 
 	positional := flag.Args()
@@ -108,17 +492,19 @@ func parseFlags() (*hashPersisterFlags, error) {
 }
 
 func resolveConfig(flags hashPersisterFlags) (*config, error) {
+	seedableOutput := flags.seedableOutput || flags.seedFile != ""
+	if err := validateSeedableBackend(seedableOutput, *flags.commonFlags.QueryBackend); err != nil {
+		return nil, err
+	}
 	if *flags.commonFlags.QueryBackend == "query" && *flags.commonFlags.AnalysisCacheClearStrategy != "skip" {
 		return nil, fmt.Errorf("--analysis-cache-clear-strategy=%s is incompatible with --query-backend=query: bazel query does not use the analysis cache", *flags.commonFlags.AnalysisCacheClearStrategy)
 	}
 
-	// Validate working directory
 	workingDirectory, err := filepath.Abs(*flags.commonFlags.WorkingDirectory)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get working directory from %v: %w", *flags.commonFlags.WorkingDirectory, err)
 	}
 
-	// Get current revision to restore later
 	currentBranch, err := pkg.GitRevParse(workingDirectory, "HEAD", true)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get current git revision: %w", err)
@@ -162,7 +548,6 @@ func resolveConfig(flags hashPersisterFlags) (*config, error) {
 		return nil, fmt.Errorf("failed to parse targets: %w", err)
 	}
 
-	// Validate output file directory exists
 	outputDir := filepath.Dir(flags.outputFile)
 	if outputDir != "." {
 		if err := os.MkdirAll(outputDir, 0755); err != nil {
@@ -171,11 +556,22 @@ func resolveConfig(flags hashPersisterFlags) (*config, error) {
 	}
 
 	return &config{
-		Context:    context,
-		CommitSha:  flags.commitSha,
-		Targets:    targetsList,
-		OutputFile: flags.outputFile,
+		Context:        context,
+		CommitSha:      flags.commitSha,
+		Targets:        targetsList,
+		OutputFile:     flags.outputFile,
+		SeedableOutput: seedableOutput,
+		SeedFile:       flags.seedFile,
+		SeedSha:        flags.seedSha,
+		VerifySeed:     flags.verifySeed,
 	}, nil
+}
+
+func validateSeedableBackend(seedableOutput bool, queryBackend string) error {
+	if seedableOutput && queryBackend != "query" {
+		return fmt.Errorf("seedable output requires --query-backend=query (got %q)", queryBackend)
+	}
+	return nil
 }
 
 func gitCheckout(workingDirectory string, rev pkg.LabelledGitRev) error {
@@ -185,4 +581,56 @@ func gitCheckout(workingDirectory string, rev pkg.LabelledGitRev) error {
 		return fmt.Errorf("failed to check out %s: %w. Output: %v", rev, err, string(output))
 	}
 	return nil
+}
+
+func gitDiffNameStatus(workingDirectory, fromSha, toSha string) (map[string]string, error) {
+	gitCmd := exec.Command("git", "diff", "--name-status", "-z", "--no-renames", fromSha+".."+toSha, "--")
+	gitCmd.Dir = workingDirectory
+	var stdout, stderr bytes.Buffer
+	gitCmd.Stdout = &stdout
+	gitCmd.Stderr = &stderr
+	if err := gitCmd.Run(); err != nil {
+		return nil, fmt.Errorf("git diff --name-status %s..%s failed: %w. Stderr: %s",
+			fromSha, toSha, err, stderr.String())
+	}
+
+	return parseGitNameStatus(stdout.Bytes())
+}
+
+func parseGitNameStatus(output []byte) (map[string]string, error) {
+	fields := bytes.Split(output, []byte{0})
+	if len(fields) > 0 && len(fields[len(fields)-1]) == 0 {
+		fields = fields[:len(fields)-1]
+	}
+	if len(fields)%2 != 0 {
+		return nil, fmt.Errorf("malformed NUL-delimited git name-status output")
+	}
+	result := make(map[string]string, len(fields)/2)
+	for i := 0; i < len(fields); i += 2 {
+		status, path := string(fields[i]), string(fields[i+1])
+		if status == "" || path == "" {
+			return nil, fmt.Errorf("malformed empty status or path in git name-status output")
+		}
+		result[path] = status
+	}
+	return result, nil
+}
+
+func copyFile(src, dst string) error {
+	data, err := os.ReadFile(src)
+	if err != nil {
+		return fmt.Errorf("failed to read %s: %w", src, err)
+	}
+	if err := os.WriteFile(dst, data, 0o644); err != nil {
+		return fmt.Errorf("failed to write %s: %w", dst, err)
+	}
+	return nil
+}
+
+func countHashes(hashes map[string]map[string]string) int {
+	n := 0
+	for _, configs := range hashes {
+		n += len(configs)
+	}
+	return n
 }

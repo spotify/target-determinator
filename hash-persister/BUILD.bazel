@@ -1,4 +1,4 @@
-load("@io_bazel_rules_go//go:def.bzl", "go_library")
+load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 load("//rules:multi_platform_go_binary.bzl", "multi_platform_go_binary")
 
 go_library(
@@ -10,6 +10,13 @@ go_library(
         "//cli",
         "//pkg",
     ],
+)
+
+go_test(
+    name = "hash-persister_test",
+    srcs = ["hash-persister_test.go"],
+    embed = [":hash-persister_lib"],
+    deps = ["//pkg"],
 )
 
 multi_platform_go_binary(
