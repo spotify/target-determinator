@@ -205,6 +205,17 @@ func (thc *TargetHashCache) ExtractHashes() map[string][]byte {
 // RestoreHashes populates the cache with pre-computed hashes and freezes the cache.
 // Keys must be formatted as "<label>\x00<configuration>".
 func (thc *TargetHashCache) RestoreHashes(hashes map[string][]byte) error {
+	return thc.populateHashes(hashes, true)
+}
+
+// SeedHashes populates the cache with pre-computed hashes without freezing
+// the cache. Hash calls may continue to compute values absent from the seed.
+// Keys must be formatted as "<label>\x00<configuration>".
+func (thc *TargetHashCache) SeedHashes(hashes map[string][]byte) error {
+	return thc.populateHashes(hashes, false)
+}
+
+func (thc *TargetHashCache) populateHashes(hashes map[string][]byte, freeze bool) error {
 	thc.cacheLock.Lock()
 	defer thc.cacheLock.Unlock()
 	for key, hash := range hashes {
@@ -224,7 +235,7 @@ func (thc *TargetHashCache) RestoreHashes(hashes map[string][]byte) error {
 		copy(hashCopy, hash)
 		thc.cache[lbl][cfg] = &cacheEntry{hash: hashCopy}
 	}
-	thc.frozen = true
+	thc.frozen = freeze
 	return nil
 }
 
@@ -581,9 +592,9 @@ func hashTarget(thc *TargetHashCache, labelAndConfiguration LabelAndConfiguratio
 		return hashRule(thc, target.Rule, configuredTarget.Configuration)
 	case build.Target_GENERATED_FILE:
 		hasher := sha256.New()
-		generatingLabel, err := thc.ParseCanonicalLabel(*target.GeneratedFile.GeneratingRule)
+		generatingLabel, err := canonicalGeneratingRuleLabel(thc, target.GeneratedFile)
 		if err != nil {
-			return nil, fmt.Errorf("failed to parse generated file generating rule label %s: %w", *target.GeneratedFile.GeneratingRule, err)
+			return nil, err
 		}
 		writeLabel(hasher, generatingLabel)
 		hash, err := thc.Hash(LabelAndConfiguration{Label: generatingLabel, Configuration: configuration})
@@ -727,11 +738,11 @@ func getConfiguredRuleInputs(thc *TargetHashCache, rule *build.Rule, ownConfigur
 			})
 		}
 	} else {
-		for _, ruleInputLabelString := range rule.RuleInput {
-			ruleInputLabel, err := thc.ParseCanonicalLabel(ruleInputLabelString)
-			if err != nil {
-				return nil, fmt.Errorf("failed to parse ruleInput label %s: %w", ruleInputLabelString, err)
-			}
+		ruleInputLabels, err := canonicalRuleInputLabels(thc, rule)
+		if err != nil {
+			return nil, err
+		}
+		for _, ruleInputLabel := range ruleInputLabels {
 			labelAndConfigurations := LabelAndConfigurations{
 				Label: ruleInputLabel,
 			}
@@ -781,6 +792,26 @@ func getConfiguredRuleInputs(thc *TargetHashCache, rule *build.Rule, ownConfigur
 		}
 	}
 	return canonicalizeRuleInputs(labelsAndConfigurations), nil
+}
+
+func canonicalRuleInputLabels(thc *TargetHashCache, rule *build.Rule) ([]gazelle_label.Label, error) {
+	labels := make([]gazelle_label.Label, 0, len(rule.RuleInput))
+	for _, input := range rule.RuleInput {
+		label, err := thc.ParseCanonicalLabel(input)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse ruleInput label %s: %w", input, err)
+		}
+		labels = append(labels, label)
+	}
+	return labels, nil
+}
+
+func canonicalGeneratingRuleLabel(thc *TargetHashCache, generatedFile *build.GeneratedFile) (gazelle_label.Label, error) {
+	label, err := thc.ParseCanonicalLabel(generatedFile.GetGeneratingRule())
+	if err != nil {
+		return label, fmt.Errorf("failed to parse generated file generating rule label %s: %w", generatedFile.GetGeneratingRule(), err)
+	}
+	return label, nil
 }
 
 func canonicalizeRuleInputs(labelsAndConfigurations []LabelAndConfigurations) []LabelAndConfigurations {
