@@ -1,10 +1,49 @@
 package pkg
 
 import (
+	"os"
+	"strings"
 	"testing"
 
 	"github.com/bazel-contrib/target-determinator/common"
 )
+
+func TestQueryPatternArgsInline(t *testing.T) {
+	args, cleanup, err := queryPatternArgs("//...")
+	defer cleanup()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(args) != 1 || args[0] != "//..." {
+		t.Fatalf("inline query args = %v, want [//...]", args)
+	}
+}
+
+func TestQueryPatternArgsUsesAndCleansUpFile(t *testing.T) {
+	pattern := strings.Repeat("x", maxInlineQueryPatternLength+1)
+	args, cleanup, err := queryPatternArgs(pattern)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(args) != 1 || !strings.HasPrefix(args[0], "--query_file=") {
+		cleanup()
+		t.Fatalf("query file args = %v", args)
+	}
+	path := strings.TrimPrefix(args[0], "--query_file=")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		cleanup()
+		t.Fatal(err)
+	}
+	if string(data) != pattern {
+		cleanup()
+		t.Fatal("query file did not contain the complete pattern")
+	}
+	cleanup()
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("query file still exists after cleanup: %v", err)
+	}
+}
 
 func Test_stringSliceContainsStartingWith(t *testing.T) {
 	type args struct {

@@ -1115,8 +1115,46 @@ func runToCqueryResult(context *Context, pattern string, includeTransitions bool
 	}
 }
 
+// maxInlineQueryPatternLength is the longest query pattern passed to bazel as
+// a command-line argument. Longer patterns (e.g. scoped seeded-mode universes
+// carrying many explicit labels) are written to a file and passed via
+// --query_file to avoid OS argv limits.
+const maxInlineQueryPatternLength = 65536
+
+// queryPatternArgs returns the bazel query arguments encoding pattern, either
+// inline or via a --query_file, along with a cleanup function.
+func queryPatternArgs(pattern string) ([]string, func(), error) {
+	if len(pattern) <= maxInlineQueryPatternLength {
+		return []string{pattern}, func() {}, nil
+	}
+	queryFile, err := os.CreateTemp("", "target-determinator-query-pattern-*.txt")
+	if err != nil {
+		return nil, func() {}, fmt.Errorf("failed to create query pattern file: %w", err)
+	}
+	cleanup := func() { os.Remove(queryFile.Name()) }
+	if _, err := queryFile.WriteString(pattern); err != nil {
+		queryFile.Close()
+		cleanup()
+		return nil, func() {}, fmt.Errorf("failed to write query pattern file: %w", err)
+	}
+	if err := queryFile.Close(); err != nil {
+		cleanup()
+		return nil, func() {}, fmt.Errorf("failed to close query pattern file: %w", err)
+	}
+	return []string{"--query_file=" + queryFile.Name()}, cleanup, nil
+}
+
+// truncateForLog shortens very long query patterns for log lines.
+func truncateForLog(pattern string) string {
+	const maxLogged = 2048
+	if len(pattern) <= maxLogged {
+		return pattern
+	}
+	return pattern[:maxLogged] + fmt.Sprintf("... (%d bytes total)", len(pattern))
+}
+
 func runToQueryResult(context *Context, pattern string) ([]*analysis.ConfiguredTarget, error) {
-	log.Printf("Running query on %s", pattern)
+	log.Printf("Running query on %s", truncateForLog(pattern))
 
 	queryOutputFile, err := os.CreateTemp("", "target-determinator-query-*.proto")
 	if err != nil {
@@ -1128,17 +1166,23 @@ func runToQueryResult(context *Context, pattern string) ([]*analysis.ConfiguredT
 		return nil, fmt.Errorf("failed to close temporary file for query output: %w", err)
 	}
 
+	patternArgs, patternCleanup, err := queryPatternArgs(pattern)
+	defer patternCleanup()
+	if err != nil {
+		return nil, err
+	}
+
 	var stderr bytes.Buffer
 	// Unlike cquery (which only gained streamed_proto and output_file in Bazel 8.2),
 	// bazel query has supported both since well before any Bazel version this tool targets.
 	returnVal, err := context.BazelCmd.Execute(
 		BazelCmdConfig{Dir: context.WorkspacePath, Stderr: &stderr},
 		[]string{"--output_base", context.BazelOutputBase},
-		"query", "--output=streamed_proto", "--order_output=no",
-		"--output_file="+queryOutput, pattern)
+		"query", append([]string{"--output=streamed_proto", "--order_output=no",
+			"--output_file=" + queryOutput}, patternArgs...)...)
 
 	if returnVal != 0 || err != nil {
-		return nil, fmt.Errorf("failed to run query on %s: %w. Stderr:\n%v", pattern, err, stderr.String())
+		return nil, fmt.Errorf("failed to run query on %s: %w. Stderr:\n%v", truncateForLog(pattern), err, stderr.String())
 	}
 
 	queryOutputFile, err = os.Open(queryOutput)
@@ -1167,17 +1211,23 @@ func runToQueryResult(context *Context, pattern string) ([]*analysis.ConfiguredT
 }
 
 func runToQueryLabels(context *Context, pattern string, normalizer *Normalizer) ([]label.Label, error) {
-	log.Printf("Running query (labels) on %s", pattern)
+	log.Printf("Running query (labels) on %s", truncateForLog(pattern))
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
+
+	patternArgs, patternCleanup, err := queryPatternArgs(pattern)
+	defer patternCleanup()
+	if err != nil {
+		return nil, err
+	}
 
 	returnVal, err := context.BazelCmd.Execute(
 		BazelCmdConfig{Dir: context.WorkspacePath, Stdout: &stdout, Stderr: &stderr},
 		[]string{"--output_base", context.BazelOutputBase},
-		"query", "--output=label", "--order_output=no", pattern)
+		"query", append([]string{"--output=label", "--order_output=no"}, patternArgs...)...)
 
 	if returnVal != 0 || err != nil {
-		return nil, fmt.Errorf("failed to run query on %s: %w. Stderr:\n%v", pattern, err, stderr.String())
+		return nil, fmt.Errorf("failed to run query on %s: %w. Stderr:\n%v", truncateForLog(pattern), err, stderr.String())
 	}
 
 	var labels []label.Label

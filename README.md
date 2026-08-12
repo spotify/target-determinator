@@ -62,6 +62,60 @@ Target Determinator now includes hash persistence capabilities for optimized CI 
 
 These tools enable faster target determination in CI by pre-computing hashes once per commit and reusing them across multiple comparisons.
 
+### Incremental hash persistence
+
+A normal `hash-persister` run asks Bazel for the complete target graph selected by `--targets`, computes every target hash, and writes the existing comparison artifact for the requested Git revision. It does not include the dependency edges needed by incremental hashing. Passing `--seedable-output` opts into a larger artifact that also contains those edges and compatibility metadata.
+
+Incremental mode starts with a seedable artifact from an earlier revision, uses the Git diff and the persisted dependency graph to find targets that may have changed, and queries and hashes only that smaller set. Hashes for unaffected targets are copied into the new artifact, which is again complete and seedable for a later run.
+
+Incremental mode is enabled by passing both `--seed-file` and `--seed-sha`. It currently requires the faster, configuration-independent `query` backend:
+
+```sh
+hash-persister \
+  --working-directory . \
+  --query-backend=query \
+  --output "hashes-${NEW_SHA}.json" \
+  --seed-file "hashes-${BASE_SHA}.json" \
+  --seed-sha "${BASE_SHA}" \
+  "${NEW_SHA}"
+```
+
+`--seed-file` is the JSON artifact produced for the revision named by `--seed-sha`. The seed must use the current seed-capable artifact format and must have been created with compatible hashing inputs, including the Bazel release, target expression, query backend, Bazel options, and rule-class fingerprints. These inputs are represented by a compatibility fingerprint embedded in the artifact. Supplying `--seed-file` automatically makes the new output seedable, including when incremental execution falls back to a full computation.
+
+Incremental hashing is an optimization rather than a weaker correctness mode. If `hash-persister` cannot prove that reuse is safe, it logs a bounded fallback code and performs a normal full computation. This includes incompatible or malformed seeds and changes that can affect Bazel loading or package boundaries without appearing in the persisted target graph, such as changes to Starlark, workspace or module metadata, Bazel configuration files, or BUILD-file boundaries. The resulting output is still a complete artifact for the requested revision and can seed a later incremental run.
+
+To create the first compatible seed, explicitly request seedable output while selecting the `query` backend:
+
+```sh
+hash-persister \
+  --working-directory . \
+  --query-backend=query \
+  --seedable-output \
+  --output "hashes-${BASE_SHA}.json" \
+  "${BASE_SHA}"
+```
+
+#### Verifying incremental results
+
+`--verify-seed` runs both incremental and full hashing for the destination revision and compares the resulting target hashes:
+
+```sh
+hash-persister \
+  --working-directory . \
+  --query-backend=query \
+  --output "hashes-${NEW_SHA}.json" \
+  --seed-file "hashes-${BASE_SHA}.json" \
+  --seed-sha "${BASE_SHA}" \
+  --verify-seed \
+  "${NEW_SHA}"
+```
+
+Verification exits nonzero if the two results differ or if incremental execution falls back to full hashing. When the two computations differ, the output path receives the full result so it remains safe for investigation and downstream use. A fallback stops verification rather than treating two full computations as evidence that incremental mode is correct. Verification is intended for rollout checks and sampling rather than the normal fast path because it deliberately performs both computations.
+
+#### Execution reports
+
+Pass `--execution-report <path>` to write a versioned, machine-readable JSON summary. The report distinguishes the requested mode from the mode actually used, records success or failure and any fallback code, and includes counts for changed files, dirty packages and targets, recomputed targets, reused targets, and total targets. This lets CI systems emit bounded metrics without parsing human-readable logs.
+
 ## driver binary
 
 `driver` is a binary which implements a simple CI pipeline; it runs the same logic as `target-determinator`, then tests all identified targets.
