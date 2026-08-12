@@ -27,7 +27,6 @@ type hashPersisterFlags struct {
 	seedableOutput bool
 	seedFile       string
 	seedSha        string
-	verifySeed     bool
 	reportFile     string
 }
 
@@ -39,7 +38,6 @@ type config struct {
 	SeedableOutput bool
 	SeedFile       string
 	SeedSha        string
-	VerifySeed     bool
 	ReportFile     string
 }
 
@@ -112,10 +110,6 @@ func execute() (returnErr error) {
 		report.RequestedMode = "incremental"
 		report.EffectiveMode = "incremental"
 	}
-	if cfg.VerifySeed {
-		report.RequestedMode = "verify"
-		report.EffectiveMode = "verify"
-	}
 	defer func() {
 		if returnErr != nil {
 			report.Status = "failed"
@@ -136,10 +130,6 @@ func execute() (returnErr error) {
 			returnErr = fmt.Errorf("failed to check out original commit during cleanup: %w", innerErr)
 		}
 	}()
-
-	if cfg.VerifySeed && cfg.SeedFile != "" {
-		return runVerifySeed(cfg)
-	}
 
 	if cfg.SeedFile != "" {
 		outcome, err := runSeeded(cfg)
@@ -476,73 +466,6 @@ func mergePersistedEntries[V any](seed map[string]V, dirty map[string]bool, fres
 	return merged
 }
 
-func runVerifySeed(cfg *config) error {
-	log.Printf("Verify-seed mode: computing seeded AND full hashes for %s", cfg.CommitSha)
-
-	seededOutput, err := os.CreateTemp("", "td-verify-seeded-*.json")
-	if err != nil {
-		return fmt.Errorf("failed to create temp file for seeded output: %w", err)
-	}
-	seededPath := seededOutput.Name()
-	seededOutput.Close()
-	defer os.Remove(seededPath)
-
-	fullOutput, err := os.CreateTemp("", "td-verify-full-*.json")
-	if err != nil {
-		return fmt.Errorf("failed to create temp file for full output: %w", err)
-	}
-	fullPath := fullOutput.Name()
-	fullOutput.Close()
-	defer os.Remove(fullPath)
-
-	seededCfg := *cfg
-	seededCfg.OutputFile = seededPath
-	seededCfg.VerifySeed = false
-	outcome, err := runSeeded(&seededCfg)
-	if err != nil {
-		return err
-	}
-	if !outcome.UsedSeed {
-		return fmt.Errorf("verify-seed did not exercise seeded mode: %s", outcome.FallbackDetail)
-	}
-
-	fullCfg := *cfg
-	fullCfg.OutputFile = fullPath
-	fullCfg.SeedFile = ""
-	fullCfg.SeedSha = ""
-	fullCfg.VerifySeed = false
-	if _, err := runFull(&fullCfg); err != nil {
-		return err
-	}
-
-	result, err := pkg.CompareHashFiles(fullPath, seededPath)
-	if err != nil {
-		return fmt.Errorf("failed to compare hash files: %w", err)
-	}
-
-	if len(result.Differences) == 0 {
-		log.Printf("VERIFY-SEED: PASS — seeded output matches full computation")
-		return copyFile(fullPath, cfg.OutputFile)
-	} else {
-		log.Printf("VERIFY-SEED: FAIL — %d differences found:", len(result.Differences))
-		log.Printf("  Changed: %d, Added: %d, Removed: %d",
-			result.Summary.TotalChanged, result.Summary.TotalAdded, result.Summary.TotalRemoved)
-		for i, diff := range result.Differences {
-			if i >= 20 {
-				log.Printf("  ... and %d more", len(result.Differences)-20)
-				break
-			}
-			log.Printf("  %s [%s] %s: before=%s after=%s",
-				diff.Label, diff.Configuration, diff.Status,
-				diff.BeforeHash, diff.AfterHash)
-		}
-		if err := copyFile(fullPath, cfg.OutputFile); err != nil {
-			return err
-		}
-		return fmt.Errorf("verify-seed found %d hash differences", len(result.Differences))
-	}
-}
-
 func parseFlags() (*hashPersisterFlags, error) {
 	var flags hashPersisterFlags
 	flags.commonFlags = cli.RegisterCommonFlags()
@@ -550,7 +473,6 @@ func parseFlags() (*hashPersisterFlags, error) {
 	flag.BoolVar(&flags.seedableOutput, "seedable-output", false, "Include dependency edges and compatibility metadata so the output can seed incremental hashing")
 	flag.StringVar(&flags.seedFile, "seed-file", "", "Path to a compatible seed hash file for incremental hashing")
 	flag.StringVar(&flags.seedSha, "seed-sha", "", "Git commit SHA of the seed file (required with --seed-file)")
-	flag.BoolVar(&flags.verifySeed, "verify-seed", false, "Run both seeded and full computation, compare, exit non-zero on divergence")
 	flag.StringVar(&flags.reportFile, "execution-report", "", "Optional path for a machine-readable JSON execution report")
 
 	flag.Parse()
@@ -562,10 +484,6 @@ func parseFlags() (*hashPersisterFlags, error) {
 	if flags.seedFile != "" && flags.seedSha == "" {
 		return nil, fmt.Errorf("--seed-sha is required when --seed-file is specified")
 	}
-	if flags.verifySeed && flags.seedFile == "" {
-		return nil, fmt.Errorf("--verify-seed requires --seed-file")
-	}
-
 	positional := flag.Args()
 	if len(positional) != 1 {
 		return nil, fmt.Errorf("expected one positional argument, <git-commit-sha>, but got %d", len(positional))
@@ -647,7 +565,6 @@ func resolveConfig(flags hashPersisterFlags) (*config, error) {
 		SeedableOutput: seedableOutput,
 		SeedFile:       flags.seedFile,
 		SeedSha:        flags.seedSha,
-		VerifySeed:     flags.verifySeed,
 		ReportFile:     flags.reportFile,
 	}, nil
 }
@@ -727,17 +644,6 @@ func parseGitNameStatus(output []byte) (map[string]string, error) {
 		result[path] = status
 	}
 	return result, nil
-}
-
-func copyFile(src, dst string) error {
-	data, err := os.ReadFile(src)
-	if err != nil {
-		return fmt.Errorf("failed to read %s: %w", src, err)
-	}
-	if err := os.WriteFile(dst, data, 0o644); err != nil {
-		return fmt.Errorf("failed to write %s: %w", dst, err)
-	}
-	return nil
 }
 
 func countHashes(hashes map[string]map[string]string) int {

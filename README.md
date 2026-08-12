@@ -95,23 +95,6 @@ hash-persister \
   "${BASE_SHA}"
 ```
 
-#### Verifying incremental results
-
-`--verify-seed` runs both incremental and full hashing for the destination revision and compares the resulting target hashes:
-
-```sh
-hash-persister \
-  --working-directory . \
-  --query-backend=query \
-  --output "hashes-${NEW_SHA}.json" \
-  --seed-file "hashes-${BASE_SHA}.json" \
-  --seed-sha "${BASE_SHA}" \
-  --verify-seed \
-  "${NEW_SHA}"
-```
-
-Verification exits nonzero if the two results differ or if incremental execution falls back to full hashing. When the two computations differ, the output path receives the full result so it remains safe for investigation and downstream use. A fallback stops verification rather than treating two full computations as evidence that incremental mode is correct. Verification is intended for rollout checks and sampling rather than the normal fast path because it deliberately performs both computations.
-
 #### Execution reports
 
 Pass `--execution-report <path>` to write a versioned, machine-readable JSON summary. The report distinguishes the requested mode from the mode actually used, records success or failure and any fallback code, and includes counts for changed files, dirty packages and targets, recomputed targets, reused targets, and total targets. This lets CI systems emit bounded metrics without parsing human-readable logs.
