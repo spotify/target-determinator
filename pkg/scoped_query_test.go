@@ -1,6 +1,7 @@
 package pkg
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -47,8 +48,9 @@ func TestScopeTargetsPatternPlain(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ScopeTargetsPattern: %v", err)
 	}
-	if got != "(//pkg:all)" {
-		t.Errorf("want %q, got %q", "(//pkg:all)", got)
+	want := "let target_determinator_scoped_universe = (//pkg:all) in ($target_determinator_scoped_universe)"
+	if got != want {
+		t.Errorf("want %q, got %q", want, got)
 	}
 }
 
@@ -58,9 +60,12 @@ func TestScopeTargetsPatternManualFilter(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ScopeTargetsPattern: %v", err)
 	}
-	want := `(//pkg:all + set(//app:binary)) - attr(tags, "manual", (//pkg:all + set(//app:binary)))`
+	want := `let target_determinator_scoped_universe = (//pkg:all + set(//app:binary)) in ($target_determinator_scoped_universe - attr(tags, "manual", $target_determinator_scoped_universe))`
 	if got != want {
 		t.Errorf("want %q, got %q", want, got)
+	}
+	if strings.Count(got, "//app:binary") != 1 {
+		t.Fatalf("scoped universe was repeated in query: %q", got)
 	}
 }
 
@@ -68,15 +73,22 @@ func TestScopeTargetsPatternNoWildcard(t *testing.T) {
 	if _, err := ScopeTargetsPattern("//app:binary", "(//pkg:all)"); err == nil {
 		t.Fatal("expected error for pattern without //...")
 	}
+	if _, err := ScopeTargetsPattern("@repo//...", "(//pkg:all)"); err == nil {
+		t.Fatal("expected error for pattern containing only a repository-qualified wildcard")
+	}
 }
 
 func TestScopeTargetsPatternDoesNotRewriteExternalWildcard(t *testing.T) {
-	got, err := ScopeTargetsPattern("@repo//... + //...", "(//pkg:all)")
-	if err != nil {
-		t.Fatal(err)
-	}
-	want := "@repo//... + (//pkg:all)"
-	if got != want {
-		t.Fatalf("ScopeTargetsPattern = %q, want %q", got, want)
+	for _, repositoryWildcard := range []string{"@repo//...", "@@canonical_repo//..."} {
+		t.Run(repositoryWildcard, func(t *testing.T) {
+			got, err := ScopeTargetsPattern(repositoryWildcard+" + //...", "(//pkg:all)")
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := "let target_determinator_scoped_universe = (//pkg:all) in (" + repositoryWildcard + " + $target_determinator_scoped_universe)"
+			if got != want {
+				t.Fatalf("ScopeTargetsPattern = %q, want %q", got, want)
+			}
+		})
 	}
 }
