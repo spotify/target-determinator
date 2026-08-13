@@ -80,6 +80,62 @@ func TestWriteExecutionReport(t *testing.T) {
 	}
 }
 
+func TestShouldFallbackForRecomputation(t *testing.T) {
+	tests := map[string]struct {
+		recomputed int
+		total      int
+		want       bool
+	}{
+		"below threshold":    {recomputed: 69, total: 100, want: false},
+		"at threshold":       {recomputed: 70, total: 100, want: true},
+		"above threshold":    {recomputed: 71, total: 100, want: true},
+		"fractional below":   {recomputed: 6, total: 9, want: false},
+		"fractional at":      {recomputed: 7, total: 10, want: true},
+		"empty seed":         {recomputed: 0, total: 0, want: false},
+		"no dirty targets":   {recomputed: 0, total: 100, want: false},
+		"dirty exceeds seed": {recomputed: 2, total: 1, want: true},
+	}
+
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			if got := shouldFallbackForRecomputation(test.recomputed, test.total); got != test.want {
+				t.Fatalf("shouldFallbackForRecomputation(%d, %d) = %v, want %v",
+					test.recomputed, test.total, got, test.want)
+			}
+		})
+	}
+}
+
+func TestHighRecomputationFallbackIsReported(t *testing.T) {
+	if highRecomputationFallbackCode != "high_recomputation_ratio" {
+		t.Fatalf("fallback code = %q, want stable metric value", highRecomputationFallbackCode)
+	}
+	report := &executionReport{RequestedMode: "incremental", EffectiveMode: "incremental"}
+	applySeededOutcome(report, seededOutcome{
+		FallbackCode:          highRecomputationFallbackCode,
+		FallbackDetail:        "dirty set includes 70 of 100 seeded targets",
+		RecomputedTargetCount: 100,
+		TotalTargetCount:      100,
+	})
+	if report.EffectiveMode != "full" || report.FallbackCode != highRecomputationFallbackCode {
+		t.Fatalf("fallback report = %#v", report)
+	}
+}
+
+func TestCountDirtySeedTargetsIgnoresNonPersistedLabels(t *testing.T) {
+	targetHashes := map[string]map[string]string{
+		"//app:binary":  nil,
+		"//lib:library": nil,
+	}
+	dirtyLabels := map[string]bool{
+		"//app:binary":    true,
+		"//app:source.go": true,
+	}
+	if got := countDirtySeedTargets(targetHashes, dirtyLabels); got != 1 {
+		t.Fatalf("countDirtySeedTargets() = %d, want 1", got)
+	}
+}
+
 func TestParseGitNameStatusPreservesWhitespace(t *testing.T) {
 	got, err := parseGitNameStatus([]byte("M\x00pkg/file name.txt\x00A\x00nested dir/new file.txt\x00"))
 	if err != nil {

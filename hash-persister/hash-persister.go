@@ -58,6 +58,14 @@ type fallbackReason struct {
 	Detail string
 }
 
+const (
+	// Incremental hashing still pays the fixed costs of loading the seed,
+	// propagating the dirty set, and merging a complete output. Require it to
+	// reuse at least 30% of seeded targets before paying those costs.
+	incrementalRecomputationFallbackPercent = 70
+	highRecomputationFallbackCode           = "high_recomputation_ratio"
+)
+
 type executionReport struct {
 	SchemaVersion         int    `json:"schema_version"`
 	RequestedMode         string `json:"requested_mode"`
@@ -266,6 +274,14 @@ func runSeeded(cfg *config) (seededOutcome, error) {
 		return outcome, nil
 	}
 
+	estimatedRecomputedTargets := countDirtySeedTargets(seedData.TargetHashes, dirtyResult.DirtyStarLabels)
+	seedTargetCount := len(seedData.TargetHashes)
+	if shouldFallbackForRecomputation(estimatedRecomputedTargets, seedTargetCount) {
+		return fallback(highRecomputationFallbackCode, fmt.Sprintf(
+			"dirty set includes %d of %d seeded targets (at least %d%%)",
+			estimatedRecomputedTargets, seedTargetCount, incrementalRecomputationFallbackPercent))
+	}
+
 	// The scoped universe re-lists every dirty package with a wildcard (to
 	// pick up added and deleted targets) and names the rdeps-propagated
 	// targets in unchanged packages explicitly.
@@ -355,6 +371,23 @@ func runSeeded(cfg *config) (seededOutcome, error) {
 	outcome.TotalTargetCount = len(persistedData.TargetHashes)
 	outcome.ReusedTargetCount = outcome.TotalTargetCount - outcome.RecomputedTargetCount
 	return outcome, nil
+}
+
+func countDirtySeedTargets(targetHashes map[string]map[string]string, dirtyLabels map[string]bool) int {
+	count := 0
+	for label := range targetHashes {
+		if dirtyLabels[label] {
+			count++
+		}
+	}
+	return count
+}
+
+func shouldFallbackForRecomputation(recomputedTargets, totalTargets int) bool {
+	if totalTargets <= 0 || recomputedTargets <= 0 {
+		return false
+	}
+	return recomputedTargets*100 >= totalTargets*incrementalRecomputationFallbackPercent
 }
 
 func validateSeed(seedData *pkg.PersistedHashData, expectedSha, expectedFingerprint string) *fallbackReason {
