@@ -84,6 +84,8 @@ hash-persister \
 
 Incremental hashing is an optimization rather than a weaker correctness mode. If `hash-persister` cannot prove that reuse is safe, it logs a bounded fallback code and performs a normal full computation. This includes incompatible or malformed seeds and changes that can affect Bazel loading or package boundaries without appearing in the persisted target graph, such as changes to Starlark, workspace or module metadata, Bazel configuration files, or BUILD-file boundaries. The resulting output is still a complete artifact for the requested revision. It can seed a later incremental run only when `--seedable-output` was requested.
 
+By default, `hash-persister` also falls back when incremental hashing would recompute at least 70% of the targets in the seed, since the fixed costs of loading and merging the seed are unlikely to pay off. Use `--incremental-recomputation-fallback-percent` to tune that threshold from 1 to 100 for a particular repository.
+
 To create the first compatible seed, explicitly request seedable output while selecting the `query` backend:
 
 ```sh

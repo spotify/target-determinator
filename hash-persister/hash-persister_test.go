@@ -84,25 +84,40 @@ func TestShouldFallbackForRecomputation(t *testing.T) {
 	tests := map[string]struct {
 		recomputed int
 		total      int
+		threshold  int
 		want       bool
 	}{
-		"below threshold":    {recomputed: 69, total: 100, want: false},
-		"at threshold":       {recomputed: 70, total: 100, want: true},
-		"above threshold":    {recomputed: 71, total: 100, want: true},
-		"fractional below":   {recomputed: 6, total: 9, want: false},
-		"fractional at":      {recomputed: 7, total: 10, want: true},
-		"empty seed":         {recomputed: 0, total: 0, want: false},
-		"no dirty targets":   {recomputed: 0, total: 100, want: false},
-		"dirty exceeds seed": {recomputed: 2, total: 1, want: true},
+		"below threshold":    {recomputed: 69, total: 100, threshold: 70, want: false},
+		"at threshold":       {recomputed: 70, total: 100, threshold: 70, want: true},
+		"above threshold":    {recomputed: 71, total: 100, threshold: 70, want: true},
+		"custom threshold":   {recomputed: 50, total: 100, threshold: 50, want: true},
+		"fractional below":   {recomputed: 6, total: 9, threshold: 70, want: false},
+		"fractional at":      {recomputed: 7, total: 10, threshold: 70, want: true},
+		"empty seed":         {recomputed: 0, total: 0, threshold: 70, want: false},
+		"no dirty targets":   {recomputed: 0, total: 100, threshold: 70, want: false},
+		"dirty exceeds seed": {recomputed: 2, total: 1, threshold: 70, want: true},
 	}
 
 	for name, test := range tests {
 		t.Run(name, func(t *testing.T) {
-			if got := shouldFallbackForRecomputation(test.recomputed, test.total); got != test.want {
-				t.Fatalf("shouldFallbackForRecomputation(%d, %d) = %v, want %v",
-					test.recomputed, test.total, got, test.want)
+			if got := shouldFallbackForRecomputation(test.recomputed, test.total, test.threshold); got != test.want {
+				t.Fatalf("shouldFallbackForRecomputation(%d, %d, %d) = %v, want %v",
+					test.recomputed, test.total, test.threshold, got, test.want)
 			}
 		})
+	}
+}
+
+func TestValidateRecomputationFallbackPercent(t *testing.T) {
+	for _, percent := range []int{1, 70, 100} {
+		if err := validateRecomputationFallbackPercent(percent); err != nil {
+			t.Errorf("valid percentage %d rejected: %v", percent, err)
+		}
+	}
+	for _, percent := range []int{-1, 0, 101} {
+		if err := validateRecomputationFallbackPercent(percent); err == nil {
+			t.Errorf("invalid percentage %d accepted", percent)
+		}
 	}
 }
 

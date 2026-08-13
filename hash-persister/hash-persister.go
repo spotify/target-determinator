@@ -21,24 +21,26 @@ import (
 )
 
 type hashPersisterFlags struct {
-	commonFlags    *cli.CommonFlags
-	commitSha      string
-	outputFile     string
-	seedableOutput bool
-	seedFile       string
-	seedSha        string
-	reportFile     string
+	commonFlags     *cli.CommonFlags
+	commitSha       string
+	outputFile      string
+	seedableOutput  bool
+	seedFile        string
+	seedSha         string
+	reportFile      string
+	fallbackPercent int
 }
 
 type config struct {
-	Context        *pkg.Context
-	CommitSha      string
-	Targets        pkg.TargetsList
-	OutputFile     string
-	SeedableOutput bool
-	SeedFile       string
-	SeedSha        string
-	ReportFile     string
+	Context         *pkg.Context
+	CommitSha       string
+	Targets         pkg.TargetsList
+	OutputFile      string
+	SeedableOutput  bool
+	SeedFile        string
+	SeedSha         string
+	ReportFile      string
+	FallbackPercent int
 }
 
 type seededOutcome struct {
@@ -60,10 +62,10 @@ type fallbackReason struct {
 
 const (
 	// Incremental hashing still pays the fixed costs of loading the seed,
-	// propagating the dirty set, and merging a complete output. Require it to
-	// reuse at least 30% of seeded targets before paying those costs.
-	incrementalRecomputationFallbackPercent = 70
-	highRecomputationFallbackCode           = "high_recomputation_ratio"
+	// propagating the dirty set, and merging a complete output. By default,
+	// require it to reuse at least 30% of seeded targets before paying those costs.
+	defaultRecomputationFallbackPercent = 70
+	highRecomputationFallbackCode       = "high_recomputation_ratio"
 )
 
 type executionReport struct {
@@ -281,10 +283,14 @@ func runSeeded(cfg *config) (seededOutcome, error) {
 
 	estimatedRecomputedTargets := countDirtySeedTargets(seedData.TargetHashes, dirtyResult.DirtyStarLabels)
 	seedTargetCount := len(seedData.TargetHashes)
-	if shouldFallbackForRecomputation(estimatedRecomputedTargets, seedTargetCount) {
+	if shouldFallbackForRecomputation(
+		estimatedRecomputedTargets,
+		seedTargetCount,
+		cfg.FallbackPercent,
+	) {
 		return fallback(highRecomputationFallbackCode, fmt.Sprintf(
 			"dirty set includes %d of %d seeded targets (at least %d%%)",
-			estimatedRecomputedTargets, seedTargetCount, incrementalRecomputationFallbackPercent))
+			estimatedRecomputedTargets, seedTargetCount, cfg.FallbackPercent))
 	}
 
 	// The scoped universe re-lists every dirty package with a wildcard (to
@@ -388,11 +394,11 @@ func countDirtySeedTargets(targetHashes map[string]map[string]string, dirtyLabel
 	return count
 }
 
-func shouldFallbackForRecomputation(recomputedTargets, totalTargets int) bool {
+func shouldFallbackForRecomputation(recomputedTargets, totalTargets, fallbackPercent int) bool {
 	if totalTargets <= 0 || recomputedTargets <= 0 {
 		return false
 	}
-	return recomputedTargets*100 >= totalTargets*incrementalRecomputationFallbackPercent
+	return recomputedTargets*100 >= totalTargets*fallbackPercent
 }
 
 func validateSeed(seedData *pkg.PersistedHashData, expectedSha, expectedFingerprint string) *fallbackReason {
@@ -533,6 +539,12 @@ func parseFlags() (*hashPersisterFlags, error) {
 	flag.StringVar(&flags.seedFile, "seed-file", "", "Path to a compatible seed hash file for incremental hashing")
 	flag.StringVar(&flags.seedSha, "seed-sha", "", "Git commit SHA of the seed file (required with --seed-file)")
 	flag.StringVar(&flags.reportFile, "execution-report", "", "Optional path for a machine-readable JSON execution report")
+	flag.IntVar(
+		&flags.fallbackPercent,
+		"incremental-recomputation-fallback-percent",
+		defaultRecomputationFallbackPercent,
+		"Fall back to full hashing when an incremental run would recompute at least this percentage of seeded targets (1-100)",
+	)
 
 	flag.Parse()
 
@@ -543,6 +555,10 @@ func parseFlags() (*hashPersisterFlags, error) {
 	if flags.seedFile != "" && flags.seedSha == "" {
 		return nil, fmt.Errorf("--seed-sha is required when --seed-file is specified")
 	}
+	if err := validateRecomputationFallbackPercent(flags.fallbackPercent); err != nil {
+		return nil, err
+	}
+
 	positional := flag.Args()
 	if len(positional) != 1 {
 		return nil, fmt.Errorf("expected one positional argument, <git-commit-sha>, but got %d", len(positional))
@@ -617,15 +633,23 @@ func resolveConfig(flags hashPersisterFlags) (*config, error) {
 	}
 
 	return &config{
-		Context:        context,
-		CommitSha:      flags.commitSha,
-		Targets:        targetsList,
-		OutputFile:     flags.outputFile,
-		SeedableOutput: seedableOutput,
-		SeedFile:       flags.seedFile,
-		SeedSha:        flags.seedSha,
-		ReportFile:     flags.reportFile,
+		Context:         context,
+		CommitSha:       flags.commitSha,
+		Targets:         targetsList,
+		OutputFile:      flags.outputFile,
+		SeedableOutput:  seedableOutput,
+		SeedFile:        flags.seedFile,
+		SeedSha:         flags.seedSha,
+		ReportFile:      flags.reportFile,
+		FallbackPercent: flags.fallbackPercent,
 	}, nil
+}
+
+func validateRecomputationFallbackPercent(percent int) error {
+	if percent < 1 || percent > 100 {
+		return fmt.Errorf("--incremental-recomputation-fallback-percent must be between 1 and 100 (got %d)", percent)
+	}
+	return nil
 }
 
 func applySeededOutcome(report *executionReport, outcome seededOutcome) {
