@@ -66,6 +66,14 @@ func ComputeDirtySet(
 	knownPackages := make(map[string]bool)
 	labelsByPackage := make(map[string][]string)
 	for label := range allLabels {
+		// Changed files are always in the main workspace. External labels can
+		// share the same package path (including the root package) after
+		// labelToPackage strips their repository prefix, but they must not be
+		// selected directly by a workspace package change. Keep them in edges
+		// so reverse-dependency propagation can still traverse them.
+		if !strings.HasPrefix(label, "//") {
+			continue
+		}
 		pkg := labelToPackage(label)
 		knownPackages[pkg] = true
 		labelsByPackage[pkg] = append(labelsByPackage[pkg], label)
