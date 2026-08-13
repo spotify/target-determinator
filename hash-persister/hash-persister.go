@@ -263,9 +263,14 @@ func runSeeded(cfg *config) (seededOutcome, error) {
 
 	if len(dirtyResult.DirtyPackages) == 0 && len(dirtyResult.DirtyStarLabels) == 0 {
 		log.Printf("No targets affected; persisting seed hashes under commit %s", cfg.CommitSha)
-		seedData.GitCommitSha = cfg.CommitSha
-		seedData.Timestamp = time.Now()
-		if err := pkg.WritePersistedData(cfg.OutputFile, seedData); err != nil {
+		persistedData := newPersistedOutput(
+			cfg,
+			seedData.BazelRelease,
+			seedData.TargetHashes,
+			seedData.TargetEdges,
+			seedData.SeedCompatibilityFingerprint,
+		)
+		if err := pkg.WritePersistedData(cfg.OutputFile, persistedData); err != nil {
 			return seededOutcome{}, fmt.Errorf("failed to persist hashes: %w", err)
 		}
 		outcome.UsedSeed = true
@@ -457,6 +462,10 @@ func mergePersistedData(
 		}
 	}
 	mergedHashes := mergePersistedEntries(seedData.TargetHashes, dirtyLabels, freshHashes)
+	persistedData := newPersistedOutput(cfg, queryResults.BazelRelease, mergedHashes, nil, "")
+	if !cfg.SeedableOutput {
+		return persistedData, nil
+	}
 
 	freshEdges := make(map[string][]string)
 	if queryResults.TransitiveConfiguredTargets != nil {
@@ -467,21 +476,38 @@ func mergePersistedData(
 		}
 	}
 	mergedEdges := mergePersistedEntries(seedData.TargetEdges, dirtyLabels, freshEdges)
+	persistedData.FormatVersion = pkg.CurrentPersistedHashFormatVersion
+	persistedData.SeedCompatibilityFingerprint = compatibilityFingerprint
+	persistedData.TargetEdges = mergedEdges
+	return persistedData, nil
+}
 
-	return &pkg.PersistedHashData{
-		FormatVersion:                pkg.CurrentPersistedHashFormatVersion,
-		SeedCompatibilityFingerprint: compatibilityFingerprint,
-		GitCommitSha:                 cfg.CommitSha,
-		Timestamp:                    time.Now(),
-		BazelRelease:                 queryResults.BazelRelease,
-		TargetHashes:                 mergedHashes,
-		TargetEdges:                  mergedEdges,
+// newPersistedOutput builds a complete hash artifact while including the
+// dependency graph only when the caller explicitly requests seedable output.
+func newPersistedOutput(
+	cfg *config,
+	bazelRelease string,
+	targetHashes map[string]map[string]string,
+	targetEdges map[string][]string,
+	compatibilityFingerprint string,
+) *pkg.PersistedHashData {
+	data := &pkg.PersistedHashData{
+		GitCommitSha: cfg.CommitSha,
+		Timestamp:    time.Now(),
+		BazelRelease: bazelRelease,
+		TargetHashes: targetHashes,
 		Metadata: pkg.HashMetadata{
 			TargetsPattern: cfg.Targets.String(),
 			WorkspacePath:  cfg.Context.WorkspacePath,
-			TotalTargets:   countHashes(mergedHashes),
+			TotalTargets:   countHashes(targetHashes),
 		},
-	}, nil
+	}
+	if cfg.SeedableOutput {
+		data.FormatVersion = pkg.CurrentPersistedHashFormatVersion
+		data.SeedCompatibilityFingerprint = compatibilityFingerprint
+		data.TargetEdges = targetEdges
+	}
+	return data
 }
 
 // mergePersistedEntries retains clean seed entries and overlays entries read
@@ -527,8 +553,8 @@ func parseFlags() (*hashPersisterFlags, error) {
 }
 
 func resolveConfig(flags hashPersisterFlags) (*config, error) {
-	seedableOutput := flags.seedableOutput || flags.seedFile != ""
-	if err := validateSeedableBackend(seedableOutput, *flags.commonFlags.QueryBackend); err != nil {
+	seedableOutput := flags.seedableOutput
+	if err := validateIncrementalBackend(seedableOutput, flags.seedFile != "", *flags.commonFlags.QueryBackend); err != nil {
 		return nil, err
 	}
 	if *flags.commonFlags.QueryBackend == "query" && *flags.commonFlags.AnalysisCacheClearStrategy != "skip" {
@@ -630,9 +656,9 @@ func writeExecutionReport(path string, report *executionReport) error {
 	return nil
 }
 
-func validateSeedableBackend(seedableOutput bool, queryBackend string) error {
-	if seedableOutput && queryBackend != "query" {
-		return fmt.Errorf("seedable output requires --query-backend=query (got %q)", queryBackend)
+func validateIncrementalBackend(seedableOutput, seededInput bool, queryBackend string) error {
+	if (seedableOutput || seededInput) && queryBackend != "query" {
+		return fmt.Errorf("incremental hashing requires --query-backend=query (got %q)", queryBackend)
 	}
 	return nil
 }

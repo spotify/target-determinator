@@ -152,15 +152,72 @@ func TestParseGitNameStatusRejectsMalformedOutput(t *testing.T) {
 	}
 }
 
-func TestValidateSeedableBackend(t *testing.T) {
-	if err := validateSeedableBackend(true, "cquery"); err == nil {
-		t.Fatal("expected cquery seedable output to be rejected")
+func TestValidateIncrementalBackend(t *testing.T) {
+	tests := map[string]struct {
+		seedableOutput bool
+		seededInput    bool
+		queryBackend   string
+		wantError      bool
+	}{
+		"full compact cquery":        {queryBackend: "cquery"},
+		"full seedable cquery":       {seedableOutput: true, queryBackend: "cquery", wantError: true},
+		"incremental compact cquery": {seededInput: true, queryBackend: "cquery", wantError: true},
+		"incremental seedable cquery": {
+			seedableOutput: true,
+			seededInput:    true,
+			queryBackend:   "cquery",
+			wantError:      true,
+		},
+		"full compact query":        {queryBackend: "query"},
+		"full seedable query":       {seedableOutput: true, queryBackend: "query"},
+		"incremental compact query": {seededInput: true, queryBackend: "query"},
+		"incremental seedable query": {
+			seedableOutput: true,
+			seededInput:    true,
+			queryBackend:   "query",
+		},
 	}
-	if err := validateSeedableBackend(true, "query"); err != nil {
-		t.Fatalf("query seedable output rejected: %v", err)
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			err := validateIncrementalBackend(test.seedableOutput, test.seededInput, test.queryBackend)
+			if (err != nil) != test.wantError {
+				t.Fatalf("validateIncrementalBackend() error = %v, wantError %v", err, test.wantError)
+			}
+		})
 	}
-	if err := validateSeedableBackend(false, "cquery"); err != nil {
-		t.Fatalf("full cquery mode rejected: %v", err)
+}
+
+func TestNewPersistedOutputIncludesSeedMetadataOnlyWhenRequested(t *testing.T) {
+	hashes := map[string]map[string]string{"//pkg:target": {"": "hash"}}
+	edges := map[string][]string{"//pkg:target": {"//pkg:source"}}
+
+	for _, test := range []struct {
+		name             string
+		seededInput      bool
+		seedableOutput   bool
+		wantSeedMetadata bool
+	}{
+		{name: "full compact"},
+		{name: "full seedable", seedableOutput: true, wantSeedMetadata: true},
+		{name: "incremental compact", seededInput: true},
+		{name: "incremental seedable", seededInput: true, seedableOutput: true, wantSeedMetadata: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := &config{
+				Context:        &pkg.Context{WorkspacePath: "/workspace"},
+				CommitSha:      "new-sha",
+				Targets:        pkg.TargetsList{},
+				SeedableOutput: test.seedableOutput,
+			}
+			if test.seededInput {
+				cfg.SeedFile = "seed.json"
+			}
+			got := newPersistedOutput(cfg, "release 8", hashes, edges, "fingerprint")
+			hasSeedMetadata := got.FormatVersion != 0 || got.TargetEdges != nil || got.SeedCompatibilityFingerprint != ""
+			if hasSeedMetadata != test.wantSeedMetadata {
+				t.Fatalf("seed metadata present = %v, want %v: %#v", hasSeedMetadata, test.wantSeedMetadata, got)
+			}
+		})
 	}
 }
 
