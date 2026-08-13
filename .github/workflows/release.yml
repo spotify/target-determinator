@@ -12,6 +12,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
+      - uses: bazel-contrib/setup-bazel@0.19.0
+        with:
+          bazelisk-cache: true
+          repository-cache: true
+          disk-cache: release
       - name: build
         run: bazel build --stamp --workspace_status_command=./scripts/workspace-status.sh //target-determinator:all //driver:all //hash-differ:all //hash-persister:all && mkdir .release-artifacts && for f in $(bazel cquery --output=files 'let bins = kind(go_binary, //target-determinator:all  + //driver:all + //hash-differ:all + //hash-persister:all) in $bins - attr(tags, "\bmanual\b", $bins)'); do cp "$(bazel info execution_root)/${f}" .release-artifacts/; done
       - name: release

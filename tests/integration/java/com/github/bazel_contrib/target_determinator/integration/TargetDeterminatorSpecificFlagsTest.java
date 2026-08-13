@@ -222,6 +222,7 @@ public class TargetDeterminatorSpecificFlagsTest {
         Stream.of("--working-directory",
             testDir.toString(),
             "--bazel", "bazelisk",
+            "--bazel-startup-opts", "--nohome_rc",
             "--targets", targets,
             "--nocache_results"
         ),
