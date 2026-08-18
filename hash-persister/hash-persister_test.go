@@ -80,6 +80,77 @@ func TestWriteExecutionReport(t *testing.T) {
 	}
 }
 
+func TestShouldFallbackForRecomputation(t *testing.T) {
+	tests := map[string]struct {
+		recomputed int
+		total      int
+		threshold  int
+		want       bool
+	}{
+		"below threshold":    {recomputed: 69, total: 100, threshold: 70, want: false},
+		"at threshold":       {recomputed: 70, total: 100, threshold: 70, want: true},
+		"above threshold":    {recomputed: 71, total: 100, threshold: 70, want: true},
+		"custom threshold":   {recomputed: 50, total: 100, threshold: 50, want: true},
+		"fractional below":   {recomputed: 6, total: 9, threshold: 70, want: false},
+		"fractional at":      {recomputed: 7, total: 10, threshold: 70, want: true},
+		"empty seed":         {recomputed: 0, total: 0, threshold: 70, want: false},
+		"no dirty targets":   {recomputed: 0, total: 100, threshold: 70, want: false},
+		"dirty exceeds seed": {recomputed: 2, total: 1, threshold: 70, want: true},
+	}
+
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			if got := shouldFallbackForRecomputation(test.recomputed, test.total, test.threshold); got != test.want {
+				t.Fatalf("shouldFallbackForRecomputation(%d, %d, %d) = %v, want %v",
+					test.recomputed, test.total, test.threshold, got, test.want)
+			}
+		})
+	}
+}
+
+func TestValidateRecomputationFallbackPercent(t *testing.T) {
+	for _, percent := range []int{1, 70, 100} {
+		if err := validateRecomputationFallbackPercent(percent); err != nil {
+			t.Errorf("valid percentage %d rejected: %v", percent, err)
+		}
+	}
+	for _, percent := range []int{-1, 0, 101} {
+		if err := validateRecomputationFallbackPercent(percent); err == nil {
+			t.Errorf("invalid percentage %d accepted", percent)
+		}
+	}
+}
+
+func TestHighRecomputationFallbackIsReported(t *testing.T) {
+	if highRecomputationFallbackCode != "high_recomputation_ratio" {
+		t.Fatalf("fallback code = %q, want stable metric value", highRecomputationFallbackCode)
+	}
+	report := &executionReport{RequestedMode: "incremental", EffectiveMode: "incremental"}
+	applySeededOutcome(report, seededOutcome{
+		FallbackCode:          highRecomputationFallbackCode,
+		FallbackDetail:        "dirty set includes 70 of 100 seeded targets",
+		RecomputedTargetCount: 100,
+		TotalTargetCount:      100,
+	})
+	if report.EffectiveMode != "full" || report.FallbackCode != highRecomputationFallbackCode {
+		t.Fatalf("fallback report = %#v", report)
+	}
+}
+
+func TestCountDirtySeedTargetsIgnoresNonPersistedLabels(t *testing.T) {
+	targetHashes := map[string]map[string]string{
+		"//app:binary":  nil,
+		"//lib:library": nil,
+	}
+	dirtyLabels := map[string]bool{
+		"//app:binary":    true,
+		"//app:source.go": true,
+	}
+	if got := countDirtySeedTargets(targetHashes, dirtyLabels); got != 1 {
+		t.Fatalf("countDirtySeedTargets() = %d, want 1", got)
+	}
+}
+
 func TestParseGitNameStatusPreservesWhitespace(t *testing.T) {
 	got, err := parseGitNameStatus([]byte("M\x00pkg/file name.txt\x00A\x00nested dir/new file.txt\x00"))
 	if err != nil {
@@ -96,15 +167,72 @@ func TestParseGitNameStatusRejectsMalformedOutput(t *testing.T) {
 	}
 }
 
-func TestValidateSeedableBackend(t *testing.T) {
-	if err := validateSeedableBackend(true, "cquery"); err == nil {
-		t.Fatal("expected cquery seedable output to be rejected")
+func TestValidateIncrementalBackend(t *testing.T) {
+	tests := map[string]struct {
+		seedableOutput bool
+		seededInput    bool
+		queryBackend   string
+		wantError      bool
+	}{
+		"full compact cquery":        {queryBackend: "cquery"},
+		"full seedable cquery":       {seedableOutput: true, queryBackend: "cquery", wantError: true},
+		"incremental compact cquery": {seededInput: true, queryBackend: "cquery", wantError: true},
+		"incremental seedable cquery": {
+			seedableOutput: true,
+			seededInput:    true,
+			queryBackend:   "cquery",
+			wantError:      true,
+		},
+		"full compact query":        {queryBackend: "query"},
+		"full seedable query":       {seedableOutput: true, queryBackend: "query"},
+		"incremental compact query": {seededInput: true, queryBackend: "query"},
+		"incremental seedable query": {
+			seedableOutput: true,
+			seededInput:    true,
+			queryBackend:   "query",
+		},
 	}
-	if err := validateSeedableBackend(true, "query"); err != nil {
-		t.Fatalf("query seedable output rejected: %v", err)
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			err := validateIncrementalBackend(test.seedableOutput, test.seededInput, test.queryBackend)
+			if (err != nil) != test.wantError {
+				t.Fatalf("validateIncrementalBackend() error = %v, wantError %v", err, test.wantError)
+			}
+		})
 	}
-	if err := validateSeedableBackend(false, "cquery"); err != nil {
-		t.Fatalf("full cquery mode rejected: %v", err)
+}
+
+func TestNewPersistedOutputIncludesSeedMetadataOnlyWhenRequested(t *testing.T) {
+	hashes := map[string]map[string]string{"//pkg:target": {"": "hash"}}
+	edges := map[string][]string{"//pkg:target": {"//pkg:source"}}
+
+	for _, test := range []struct {
+		name             string
+		seededInput      bool
+		seedableOutput   bool
+		wantSeedMetadata bool
+	}{
+		{name: "full compact"},
+		{name: "full seedable", seedableOutput: true, wantSeedMetadata: true},
+		{name: "incremental compact", seededInput: true},
+		{name: "incremental seedable", seededInput: true, seedableOutput: true, wantSeedMetadata: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := &config{
+				Context:        &pkg.Context{WorkspacePath: "/workspace"},
+				CommitSha:      "new-sha",
+				Targets:        pkg.TargetsList{},
+				SeedableOutput: test.seedableOutput,
+			}
+			if test.seededInput {
+				cfg.SeedFile = "seed.json"
+			}
+			got := newPersistedOutput(cfg, "release 8", hashes, edges, "fingerprint")
+			hasSeedMetadata := got.FormatVersion != 0 || got.TargetEdges != nil || got.SeedCompatibilityFingerprint != ""
+			if hasSeedMetadata != test.wantSeedMetadata {
+				t.Fatalf("seed metadata present = %v, want %v: %#v", hasSeedMetadata, test.wantSeedMetadata, got)
+			}
+		})
 	}
 }
 

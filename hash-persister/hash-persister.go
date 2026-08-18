@@ -21,24 +21,26 @@ import (
 )
 
 type hashPersisterFlags struct {
-	commonFlags    *cli.CommonFlags
-	commitSha      string
-	outputFile     string
-	seedableOutput bool
-	seedFile       string
-	seedSha        string
-	reportFile     string
+	commonFlags     *cli.CommonFlags
+	commitSha       string
+	outputFile      string
+	seedableOutput  bool
+	seedFile        string
+	seedSha         string
+	reportFile      string
+	fallbackPercent int
 }
 
 type config struct {
-	Context        *pkg.Context
-	CommitSha      string
-	Targets        pkg.TargetsList
-	OutputFile     string
-	SeedableOutput bool
-	SeedFile       string
-	SeedSha        string
-	ReportFile     string
+	Context         *pkg.Context
+	CommitSha       string
+	Targets         pkg.TargetsList
+	OutputFile      string
+	SeedableOutput  bool
+	SeedFile        string
+	SeedSha         string
+	ReportFile      string
+	FallbackPercent int
 }
 
 type seededOutcome struct {
@@ -57,6 +59,14 @@ type fallbackReason struct {
 	Code   string
 	Detail string
 }
+
+const (
+	// Incremental hashing still pays the fixed costs of loading the seed,
+	// propagating the dirty set, and merging a complete output. By default,
+	// require it to reuse at least 30% of seeded targets before paying those costs.
+	defaultRecomputationFallbackPercent = 70
+	highRecomputationFallbackCode       = "high_recomputation_ratio"
+)
 
 type executionReport struct {
 	SchemaVersion         int    `json:"schema_version"`
@@ -255,15 +265,32 @@ func runSeeded(cfg *config) (seededOutcome, error) {
 
 	if len(dirtyResult.DirtyPackages) == 0 && len(dirtyResult.DirtyStarLabels) == 0 {
 		log.Printf("No targets affected; persisting seed hashes under commit %s", cfg.CommitSha)
-		seedData.GitCommitSha = cfg.CommitSha
-		seedData.Timestamp = time.Now()
-		if err := pkg.WritePersistedData(cfg.OutputFile, seedData); err != nil {
+		persistedData := newPersistedOutput(
+			cfg,
+			seedData.BazelRelease,
+			seedData.TargetHashes,
+			seedData.TargetEdges,
+			seedData.SeedCompatibilityFingerprint,
+		)
+		if err := pkg.WritePersistedData(cfg.OutputFile, persistedData); err != nil {
 			return seededOutcome{}, fmt.Errorf("failed to persist hashes: %w", err)
 		}
 		outcome.UsedSeed = true
 		outcome.ReusedTargetCount = len(seedData.TargetHashes)
 		outcome.TotalTargetCount = len(seedData.TargetHashes)
 		return outcome, nil
+	}
+
+	estimatedRecomputedTargets := countDirtySeedTargets(seedData.TargetHashes, dirtyResult.DirtyStarLabels)
+	seedTargetCount := len(seedData.TargetHashes)
+	if shouldFallbackForRecomputation(
+		estimatedRecomputedTargets,
+		seedTargetCount,
+		cfg.FallbackPercent,
+	) {
+		return fallback(highRecomputationFallbackCode, fmt.Sprintf(
+			"dirty set includes %d of %d seeded targets (at least %d%%)",
+			estimatedRecomputedTargets, seedTargetCount, cfg.FallbackPercent))
 	}
 
 	// The scoped universe re-lists every dirty package with a wildcard (to
@@ -357,6 +384,23 @@ func runSeeded(cfg *config) (seededOutcome, error) {
 	return outcome, nil
 }
 
+func countDirtySeedTargets(targetHashes map[string]map[string]string, dirtyLabels map[string]bool) int {
+	count := 0
+	for label := range targetHashes {
+		if dirtyLabels[label] {
+			count++
+		}
+	}
+	return count
+}
+
+func shouldFallbackForRecomputation(recomputedTargets, totalTargets, fallbackPercent int) bool {
+	if totalTargets <= 0 || recomputedTargets <= 0 {
+		return false
+	}
+	return recomputedTargets*100 >= totalTargets*fallbackPercent
+}
+
 func validateSeed(seedData *pkg.PersistedHashData, expectedSha, expectedFingerprint string) *fallbackReason {
 	if seedData.FormatVersion != pkg.CurrentPersistedHashFormatVersion {
 		return &fallbackReason{"seed_format_incompatible", fmt.Sprintf("seed format v%d is not supported (need v%d)", seedData.FormatVersion, pkg.CurrentPersistedHashFormatVersion)}
@@ -424,6 +468,10 @@ func mergePersistedData(
 		}
 	}
 	mergedHashes := mergePersistedEntries(seedData.TargetHashes, dirtyLabels, freshHashes)
+	persistedData := newPersistedOutput(cfg, queryResults.BazelRelease, mergedHashes, nil, "")
+	if !cfg.SeedableOutput {
+		return persistedData, nil
+	}
 
 	freshEdges := make(map[string][]string)
 	if queryResults.TransitiveConfiguredTargets != nil {
@@ -434,21 +482,38 @@ func mergePersistedData(
 		}
 	}
 	mergedEdges := mergePersistedEntries(seedData.TargetEdges, dirtyLabels, freshEdges)
+	persistedData.FormatVersion = pkg.CurrentPersistedHashFormatVersion
+	persistedData.SeedCompatibilityFingerprint = compatibilityFingerprint
+	persistedData.TargetEdges = mergedEdges
+	return persistedData, nil
+}
 
-	return &pkg.PersistedHashData{
-		FormatVersion:                pkg.CurrentPersistedHashFormatVersion,
-		SeedCompatibilityFingerprint: compatibilityFingerprint,
-		GitCommitSha:                 cfg.CommitSha,
-		Timestamp:                    time.Now(),
-		BazelRelease:                 queryResults.BazelRelease,
-		TargetHashes:                 mergedHashes,
-		TargetEdges:                  mergedEdges,
+// newPersistedOutput builds a complete hash artifact while including the
+// dependency graph only when the caller explicitly requests seedable output.
+func newPersistedOutput(
+	cfg *config,
+	bazelRelease string,
+	targetHashes map[string]map[string]string,
+	targetEdges map[string][]string,
+	compatibilityFingerprint string,
+) *pkg.PersistedHashData {
+	data := &pkg.PersistedHashData{
+		GitCommitSha: cfg.CommitSha,
+		Timestamp:    time.Now(),
+		BazelRelease: bazelRelease,
+		TargetHashes: targetHashes,
 		Metadata: pkg.HashMetadata{
 			TargetsPattern: cfg.Targets.String(),
 			WorkspacePath:  cfg.Context.WorkspacePath,
-			TotalTargets:   countHashes(mergedHashes),
+			TotalTargets:   countHashes(targetHashes),
 		},
-	}, nil
+	}
+	if cfg.SeedableOutput {
+		data.FormatVersion = pkg.CurrentPersistedHashFormatVersion
+		data.SeedCompatibilityFingerprint = compatibilityFingerprint
+		data.TargetEdges = targetEdges
+	}
+	return data
 }
 
 // mergePersistedEntries retains clean seed entries and overlays entries read
@@ -474,6 +539,12 @@ func parseFlags() (*hashPersisterFlags, error) {
 	flag.StringVar(&flags.seedFile, "seed-file", "", "Path to a compatible seed hash file for incremental hashing")
 	flag.StringVar(&flags.seedSha, "seed-sha", "", "Git commit SHA of the seed file (required with --seed-file)")
 	flag.StringVar(&flags.reportFile, "execution-report", "", "Optional path for a machine-readable JSON execution report")
+	flag.IntVar(
+		&flags.fallbackPercent,
+		"incremental-recomputation-fallback-percent",
+		defaultRecomputationFallbackPercent,
+		"Fall back to full hashing when an incremental run would recompute at least this percentage of seeded targets (1-100)",
+	)
 
 	flag.Parse()
 
@@ -484,6 +555,10 @@ func parseFlags() (*hashPersisterFlags, error) {
 	if flags.seedFile != "" && flags.seedSha == "" {
 		return nil, fmt.Errorf("--seed-sha is required when --seed-file is specified")
 	}
+	if err := validateRecomputationFallbackPercent(flags.fallbackPercent); err != nil {
+		return nil, err
+	}
+
 	positional := flag.Args()
 	if len(positional) != 1 {
 		return nil, fmt.Errorf("expected one positional argument, <git-commit-sha>, but got %d", len(positional))
@@ -494,8 +569,8 @@ func parseFlags() (*hashPersisterFlags, error) {
 }
 
 func resolveConfig(flags hashPersisterFlags) (*config, error) {
-	seedableOutput := flags.seedableOutput || flags.seedFile != ""
-	if err := validateSeedableBackend(seedableOutput, *flags.commonFlags.QueryBackend); err != nil {
+	seedableOutput := flags.seedableOutput
+	if err := validateIncrementalBackend(seedableOutput, flags.seedFile != "", *flags.commonFlags.QueryBackend); err != nil {
 		return nil, err
 	}
 	if *flags.commonFlags.QueryBackend == "query" && *flags.commonFlags.AnalysisCacheClearStrategy != "skip" {
@@ -558,15 +633,23 @@ func resolveConfig(flags hashPersisterFlags) (*config, error) {
 	}
 
 	return &config{
-		Context:        context,
-		CommitSha:      flags.commitSha,
-		Targets:        targetsList,
-		OutputFile:     flags.outputFile,
-		SeedableOutput: seedableOutput,
-		SeedFile:       flags.seedFile,
-		SeedSha:        flags.seedSha,
-		ReportFile:     flags.reportFile,
+		Context:         context,
+		CommitSha:       flags.commitSha,
+		Targets:         targetsList,
+		OutputFile:      flags.outputFile,
+		SeedableOutput:  seedableOutput,
+		SeedFile:        flags.seedFile,
+		SeedSha:         flags.seedSha,
+		ReportFile:      flags.reportFile,
+		FallbackPercent: flags.fallbackPercent,
 	}, nil
+}
+
+func validateRecomputationFallbackPercent(percent int) error {
+	if percent < 1 || percent > 100 {
+		return fmt.Errorf("--incremental-recomputation-fallback-percent must be between 1 and 100 (got %d)", percent)
+	}
+	return nil
 }
 
 func applySeededOutcome(report *executionReport, outcome seededOutcome) {
@@ -597,9 +680,9 @@ func writeExecutionReport(path string, report *executionReport) error {
 	return nil
 }
 
-func validateSeedableBackend(seedableOutput bool, queryBackend string) error {
-	if seedableOutput && queryBackend != "query" {
-		return fmt.Errorf("seedable output requires --query-backend=query (got %q)", queryBackend)
+func validateIncrementalBackend(seedableOutput, seededInput bool, queryBackend string) error {
+	if (seedableOutput || seededInput) && queryBackend != "query" {
+		return fmt.Errorf("incremental hashing requires --query-backend=query (got %q)", queryBackend)
 	}
 	return nil
 }

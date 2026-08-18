@@ -60,6 +60,90 @@ func TestComputeDirtySetBUILDFileChange(t *testing.T) {
 	}
 }
 
+func TestComputeDirtySetMainRootDoesNotDirtyExternalRootLabels(t *testing.T) {
+	edges := map[string][]string{
+		"//:main": {"//:root.txt"},
+		"@@bazel_tools+remote_coverage_tools_extension+remote_coverage_tools//:coverage_report_generator": {},
+		"@bazel_tools//tools/test:coverage_report_generator": {
+			"@@bazel_tools+remote_coverage_tools_extension+remote_coverage_tools//:coverage_report_generator",
+		},
+		"//.agents/skills/migrate-mma-dashboards:migrate-mma-test": {
+			"@bazel_tools//tools/test:coverage_report_generator",
+		},
+	}
+	allLabels := CollectAllLabels(edges, nil)
+
+	result := ComputeDirtySet(
+		map[string]string{"root.txt": "M"}, edges, allLabels, nil,
+	)
+
+	if !result.DirtyLabels["//:main"] {
+		t.Error("expected main-workspace root target to be dirty")
+	}
+	for _, label := range []string{
+		"@@bazel_tools+remote_coverage_tools_extension+remote_coverage_tools//:coverage_report_generator",
+		"@bazel_tools//tools/test:coverage_report_generator",
+		"//.agents/skills/migrate-mma-dashboards:migrate-mma-test",
+	} {
+		if result.DirtyStarLabels[label] {
+			t.Errorf("unrelated label %s must not become dirty", label)
+		}
+	}
+}
+
+func TestComputeDirtySetMainPackageDoesNotDirtyExternalPackageLabels(t *testing.T) {
+	edges := map[string][]string{
+		"//shared:main":                  {"//shared:source.txt"},
+		"@@canonical_repo//shared:other": {},
+		"@apparent_repo//shared:other":   {},
+	}
+	allLabels := CollectAllLabels(edges, nil)
+
+	result := ComputeDirtySet(
+		map[string]string{"shared/source.txt": "M"}, edges, allLabels, nil,
+	)
+
+	if !result.DirtyLabels["//shared:main"] {
+		t.Error("expected main-workspace target to be dirty")
+	}
+	for _, label := range []string{
+		"@@canonical_repo//shared:other",
+		"@apparent_repo//shared:other",
+	} {
+		if result.DirtyLabels[label] {
+			t.Errorf("external label %s must not be directly dirty", label)
+		}
+	}
+}
+
+func TestComputeDirtySetPropagatesThroughExternalLabels(t *testing.T) {
+	edges := map[string][]string{
+		"//pkg:changed":           {"//pkg:source.txt"},
+		"@@repo//bridge:external": {"//pkg:changed"},
+		"//consumer:transitive":   {"@@repo//bridge:external"},
+		"//consumer:direct":       {"//pkg:changed"},
+	}
+	allLabels := CollectAllLabels(edges, nil)
+
+	result := ComputeDirtySet(
+		map[string]string{"pkg/source.txt": "M"}, edges, allLabels, nil,
+	)
+
+	for _, label := range []string{
+		"//pkg:changed",
+		"@@repo//bridge:external",
+		"//consumer:transitive",
+		"//consumer:direct",
+	} {
+		if !result.DirtyStarLabels[label] {
+			t.Errorf("expected %s in DirtyStarLabels", label)
+		}
+	}
+	if result.DirtyLabels["@@repo//bridge:external"] {
+		t.Error("external label should be reached by propagation, not directly dirtied")
+	}
+}
+
 func TestComputeDirtySetBzlFallback(t *testing.T) {
 	edges := map[string][]string{
 		"//pkg:rule_a": {},
@@ -367,6 +451,7 @@ func TestLabelToPackage(t *testing.T) {
 	}{
 		{"//pkg:target", "//pkg"},
 		{"@repo//pkg:target", "//pkg"},
+		{"@@canonical_repo//pkg:target", "//pkg"},
 		{"//a/b/c:d", "//a/b/c"},
 		{"//pkg", "//pkg"},
 	}

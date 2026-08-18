@@ -66,7 +66,7 @@ These tools enable faster target determination in CI by pre-computing hashes onc
 
 A normal `hash-persister` run asks Bazel for the complete target graph selected by `--targets`, computes every target hash, and writes the existing comparison artifact for the requested Git revision. It does not include the dependency edges needed by incremental hashing. Passing `--seedable-output` opts into a larger artifact that also contains those edges and compatibility metadata.
 
-Incremental mode starts with a seedable artifact from an earlier revision, uses the Git diff and the persisted dependency graph to find targets that may have changed, and queries and hashes only that smaller set. Hashes for unaffected targets are copied into the new artifact, which is again complete and seedable for a later run.
+Incremental mode starts with a seedable artifact from an earlier revision, uses the Git diff and the persisted dependency graph to find targets that may have changed, and queries and hashes only that smaller set. Hashes for unaffected targets are copied into a complete output artifact. The output is compact by default; pass `--seedable-output` when it must seed another incremental run.
 
 Incremental mode is enabled by passing both `--seed-file` and `--seed-sha`. It currently requires the faster, configuration-independent `query` backend:
 
@@ -80,9 +80,11 @@ hash-persister \
   "${NEW_SHA}"
 ```
 
-`--seed-file` is the JSON artifact produced for the revision named by `--seed-sha`. The seed must use the current seed-capable artifact format and must have been created with compatible hashing inputs, including the Bazel release, target expression, query backend, Bazel options, and rule-class fingerprints. These inputs are represented by a compatibility fingerprint embedded in the artifact. Supplying `--seed-file` automatically makes the new output seedable, including when incremental execution falls back to a full computation.
+`--seed-file` is the JSON artifact produced for the revision named by `--seed-sha`. The seed must use the current seed-capable artifact format and must have been created with compatible hashing inputs, including the Bazel release, target expression, query backend, Bazel options, and rule-class fingerprints. These inputs are represented by a compatibility fingerprint embedded in the artifact. Supplying `--seed-file` controls how hashes are computed; it does not make the new output seedable. Add `--seedable-output` explicitly to include the dependency graph in the new output, including when incremental execution falls back to a full computation.
 
-Incremental hashing is an optimization rather than a weaker correctness mode. If `hash-persister` cannot prove that reuse is safe, it logs a bounded fallback code and performs a normal full computation. This includes incompatible or malformed seeds and changes that can affect Bazel loading or package boundaries without appearing in the persisted target graph, such as changes to Starlark, workspace or module metadata, Bazel configuration files, or BUILD-file boundaries. The resulting output is still a complete artifact for the requested revision and can seed a later incremental run.
+Incremental hashing is an optimization rather than a weaker correctness mode. If `hash-persister` cannot prove that reuse is safe, it logs a bounded fallback code and performs a normal full computation. This includes incompatible or malformed seeds and changes that can affect Bazel loading or package boundaries without appearing in the persisted target graph, such as changes to Starlark, workspace or module metadata, Bazel configuration files, or BUILD-file boundaries. The resulting output is still a complete artifact for the requested revision. It can seed a later incremental run only when `--seedable-output` was requested.
+
+By default, `hash-persister` also falls back when incremental hashing would recompute at least 70% of the targets in the seed, since the fixed costs of loading and merging the seed are unlikely to pay off. Use `--incremental-recomputation-fallback-percent` to tune that threshold from 1 to 100 for a particular repository.
 
 To create the first compatible seed, explicitly request seedable output while selecting the `query` backend:
 

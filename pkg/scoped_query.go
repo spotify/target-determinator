@@ -6,6 +6,8 @@ import (
 	"strings"
 )
 
+const scopedUniverseVariable = "target_determinator_scoped_universe"
+
 // BuildScopedUniverse returns a bazel query expression covering the scoped
 // universe of a seeded run:
 //
@@ -41,11 +43,12 @@ func BuildScopedUniverse(dirtyPackages []string, carriedLabels []string) string 
 }
 
 // ScopeTargetsPattern narrows a targets pattern built over //... to the given
-// universe expression by substituting every occurrence of //... with the
-// universe. This preserves the semantics of filters expressed over the full
-// repo — e.g. `//... - attr(tags, "manual", //...)` becomes
-// `(U) - attr(tags, "manual", (U))` — while restricting evaluation to the
-// scoped universe, so manual-tag filtering behaves identically to a full run.
+// universe expression. The universe is bound once with a Bazel query `let`
+// expression, then every occurrence of //... is replaced with a reference to
+// that binding. This preserves the semantics of filters expressed over the
+// full repo — e.g. `//... - attr(tags, "manual", //...)` becomes
+// `let U = (...) in ($U - attr(tags, "manual", $U))` — without duplicating a
+// potentially very large universe for each occurrence.
 //
 // Patterns that do not contain //... cannot be scoped this way; callers
 // should fall back to a full computation in that case.
@@ -72,7 +75,8 @@ func ScopeTargetsPattern(originalPattern string, universe string) (string, error
 		if idx > 0 && isLabelCharacter(originalPattern[idx-1]) {
 			result.WriteString("//...")
 		} else {
-			result.WriteString(universe)
+			result.WriteByte('$')
+			result.WriteString(scopedUniverseVariable)
 			replacements++
 		}
 		start = idx + len("//...")
@@ -80,7 +84,7 @@ func ScopeTargetsPattern(originalPattern string, universe string) (string, error
 	if replacements == 0 {
 		return "", fmt.Errorf("targets pattern %q does not contain //... and cannot be scoped", originalPattern)
 	}
-	return result.String(), nil
+	return fmt.Sprintf("let %s = %s in (%s)", scopedUniverseVariable, universe, result.String()), nil
 }
 
 func isLabelCharacter(c byte) bool {
