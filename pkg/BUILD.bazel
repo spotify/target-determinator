@@ -57,6 +57,8 @@ go_test(
         "//third_party/protobuf/bazel/build",
         "@bazel_gazelle//label",
         "@com_github_otiai10_copy//:copy",
+        "@com_github_stretchr_testify//assert",
+        "@com_github_stretchr_testify//require",
         "@org_golang_google_protobuf//proto",
     ],
 )

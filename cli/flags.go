@@ -43,6 +43,21 @@ func (f *RuleClassFingerprintFlag) String() string {
 	return "[" + strings.Join(parts, " ") + "]"
 }
 
+type OpaqueInputRepositoryFlag []string
+
+func (f *OpaqueInputRepositoryFlag) String() string {
+	return "[" + strings.Join(*f, ", ") + "]"
+}
+
+func (f *OpaqueInputRepositoryFlag) Set(value string) error {
+	name := strings.TrimLeft(strings.TrimSpace(value), "@")
+	if name == "" || strings.Contains(name, "//") {
+		return fmt.Errorf("invalid --opaque-input-repository value %q: expected a repository name", value)
+	}
+	*f = append(*f, name)
+	return nil
+}
+
 func (f *RuleClassFingerprintFlag) Set(value string) error {
 	idx := strings.Index(value, ":")
 	if idx < 0 {
@@ -128,6 +143,7 @@ type CommonFlags struct {
 	NoCacheResults                         bool
 	QueryBackend                           *string
 	RuleClassFingerprints                  *RuleClassFingerprintFlag
+	OpaqueInputRepositories                *OpaqueInputRepositoryFlag
 	HashDebug                              bool
 }
 
@@ -155,6 +171,7 @@ func RegisterCommonFlags() *CommonFlags {
 		NoCacheResults:                         false,
 		QueryBackend:                           StrPtr(),
 		RuleClassFingerprints:                  &RuleClassFingerprintFlag{},
+		OpaqueInputRepositories:                &OpaqueInputRepositoryFlag{},
 	}
 	flag.BoolVar(&commonFlags.Version, "version", false, "Print the version of the tool and exit.")
 	flag.StringVar(commonFlags.WorkingDirectory, "working-directory", ".", "Working directory to query.")
@@ -179,6 +196,7 @@ func RegisterCommonFlags() *CommonFlags {
 	flag.BoolVar(&commonFlags.NoCacheResults, "nocache_results", false, "Disable loading and saving of results to the cache.")
 	flag.StringVar(commonFlags.QueryBackend, "query-backend", "cquery", "Query backend to use for target discovery. Accepted values: cquery, query. 'query' is faster but less precise (no configuration resolution, no select() resolution, no incompatible target filtering).")
 	flag.Var(commonFlags.RuleClassFingerprints, "rule-class-fingerprint", "Mix the content of <file>s into the hash of any target whose rule class matches one of <glob>s. Format: '<glob>[,<glob>...]:<file>[,<file>...]'. Globs use Go path.Match syntax (e.g., 'java_*'). File paths are relative to --working-directory. Repeatable. Useful under --query-backend=query to capture toolchain/module changes that the loading phase doesn't see.")
+	flag.Var(commonFlags.OpaqueInputRepositories, "opaque-input-repository", "Treat targets in this external repository as opaque inputs: hash their canonical labels and configurations, but not their contents or transitive dependencies. Accepts an apparent or canonical repository name without leading @ characters. Repeatable.")
 	flag.BoolVar(&commonFlags.HashDebug, "hash-debug", false, "Log per-target hash component breakdown (source file paths/hashes, rule input hashes) to stderr for debugging non-deterministic hashes.")
 	return &commonFlags
 }
@@ -263,6 +281,7 @@ func ResolveCommonConfig(commonFlags *CommonFlags, beforeRevStr string) (*Common
 		NoCacheResults:                         commonFlags.NoCacheResults,
 		QueryBackend:                           *commonFlags.QueryBackend,
 		RuleClassFingerprints:                  []pkg.RuleClassFingerprint(*commonFlags.RuleClassFingerprints),
+		OpaqueInputRepositories:                []string(*commonFlags.OpaqueInputRepositories),
 	}
 
 	// Non-context attributes
