@@ -281,6 +281,30 @@ func runSeeded(cfg *config) (seededOutcome, error) {
 		return outcome, nil
 	}
 
+	commitRev, err := pkg.NewLabelledGitRev(cfg.Context.WorkspacePath, cfg.CommitSha, "commit")
+	if err != nil {
+		return seededOutcome{}, fmt.Errorf("failed to resolve commit %s: %w", cfg.CommitSha, err)
+	}
+
+	// Phase: probe dirty packages to prune false-positive rdeps.
+	//
+	// When a BUILD.bazel changes, all targets in the package are marked
+	// dirty and their rdeps cascade through the graph. But most existing
+	// targets are often unchanged (e.g. a new sibling was added). A small
+	// probe query on just the dirty packages lets us compare hashes against
+	// the seed and only propagate rdeps from targets that actually changed.
+	unprunedDirtyStarCount := len(dirtyResult.DirtyStarLabels)
+	if unprunedDirtyStarCount > len(dirtyResult.DirtyLabels) {
+		dirtyResult, err = probePruneDirtySet(cfg, commitRev, dirtyResult, seedData)
+		if err != nil {
+			log.Printf("Probe pruning failed, continuing with unpruned dirty set: %v", err)
+		} else {
+			log.Printf("Probe pruning: %d dirty* -> %d dirty* (%d eliminated)",
+				unprunedDirtyStarCount, len(dirtyResult.DirtyStarLabels),
+				unprunedDirtyStarCount-len(dirtyResult.DirtyStarLabels))
+		}
+	}
+
 	estimatedRecomputedTargets := countDirtySeedTargets(seedData.TargetHashes, dirtyResult.DirtyStarLabels)
 	seedTargetCount := len(seedData.TargetHashes)
 	if shouldFallbackForRecomputation(
@@ -318,11 +342,6 @@ func runSeeded(cfg *config) (seededOutcome, error) {
 	scopedPattern, err := pkg.ScopeTargetsPattern(cfg.Targets.String(), universe)
 	if err != nil {
 		return fallback("unscopable_target_pattern", fmt.Sprintf("cannot scope targets pattern: %v", err))
-	}
-
-	commitRev, err := pkg.NewLabelledGitRev(cfg.Context.WorkspacePath, cfg.CommitSha, "commit")
-	if err != nil {
-		return seededOutcome{}, fmt.Errorf("failed to resolve commit %s: %w", cfg.CommitSha, err)
 	}
 
 	phaseStart = time.Now()
@@ -382,6 +401,95 @@ func runSeeded(cfg *config) (seededOutcome, error) {
 	outcome.TotalTargetCount = len(persistedData.TargetHashes)
 	outcome.ReusedTargetCount = outcome.TotalTargetCount - outcome.RecomputedTargetCount
 	return outcome, nil
+}
+
+// probePruneDirtySet runs a small probe query on just the dirty packages,
+// hashes those targets with seed hashes for their dependencies, and returns
+// a pruned DirtySetResult where rdeps are only propagated from targets
+// whose hash actually changed.
+func probePruneDirtySet(
+	cfg *config,
+	commitRev pkg.LabelledGitRev,
+	dirtyResult *pkg.DirtySetResult,
+	seedData *pkg.PersistedHashData,
+) (*pkg.DirtySetResult, error) {
+	phaseStart := time.Now()
+
+	probeHashes, err := probePackageHashes(cfg, commitRev, dirtyResult.DirtyPackages, seedData)
+	if err != nil {
+		return nil, err
+	}
+	log.Printf("Phase probe completed in %v (%d targets in %d packages)",
+		time.Since(phaseStart), len(probeHashes), len(dirtyResult.DirtyPackages))
+
+	return pkg.PruneDirtySet(dirtyResult, seedData.TargetHashes, seedData.TargetEdges, probeHashes), nil
+}
+
+// probePackageHashes queries and hashes targets in the given packages,
+// seeding dependency hashes from the seed file so that only the dirty
+// packages need a Bazel query.
+func probePackageHashes(
+	cfg *config,
+	commitRev pkg.LabelledGitRev,
+	dirtyPackages []string,
+	seedData *pkg.PersistedHashData,
+) (map[string]string, error) {
+	probeUniverse := pkg.BuildScopedUniverse(dirtyPackages, nil)
+	probePattern, err := pkg.ScopeTargetsPattern(cfg.Targets.String(), probeUniverse)
+	if err != nil {
+		return nil, fmt.Errorf("cannot scope probe pattern: %w", err)
+	}
+	probeTargets, err := pkg.ParseTargetsList(probePattern)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse probe targets: %w", err)
+	}
+
+	probeResults, probeCleanup, err := pkg.LoadIncompleteMetadata(cfg.Context, commitRev, probeTargets)
+	if err != nil {
+		probeCleanup()
+		return nil, fmt.Errorf("probe query failed: %w", err)
+	}
+	defer probeCleanup()
+
+	probeSeedHashes, err := buildExternalSeedHashes(seedData, dirtyPackages)
+	if err != nil {
+		return nil, err
+	}
+	if err := probeResults.TargetHashCache.SeedHashes(probeSeedHashes); err != nil {
+		return nil, fmt.Errorf("cannot seed probe hashes: %w", err)
+	}
+
+	if err := probeResults.PrefillCache(); err != nil {
+		return nil, fmt.Errorf("probe hashing failed: %w", err)
+	}
+
+	return pkg.ProbeHashesFromQueryResults(probeResults)
+}
+
+// buildExternalSeedHashes collects seed hashes for all targets NOT in the
+// given packages, so that dependency hashes resolve without a full query.
+func buildExternalSeedHashes(
+	seedData *pkg.PersistedHashData,
+	dirtyPackages []string,
+) (map[string][]byte, error) {
+	dirtyPkgSet := make(map[string]bool, len(dirtyPackages))
+	for _, p := range dirtyPackages {
+		dirtyPkgSet[p] = true
+	}
+	hashes := make(map[string][]byte)
+	for label, configMap := range seedData.TargetHashes {
+		if dirtyPkgSet[pkg.LabelPackage(label)] {
+			continue
+		}
+		for configStr, hashHex := range configMap {
+			hashBytes, err := hex.DecodeString(hashHex)
+			if err != nil {
+				return nil, fmt.Errorf("invalid seed hash for %s: %w", label, err)
+			}
+			hashes[label+"\x00"+configStr] = hashBytes
+		}
+	}
+	return hashes, nil
 }
 
 func countDirtySeedTargets(targetHashes map[string]map[string]string, dirtyLabels map[string]bool) int {

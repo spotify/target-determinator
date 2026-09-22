@@ -1,6 +1,7 @@
 package pkg
 
 import (
+	"encoding/hex"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -168,6 +169,118 @@ func ComputeDirtySet(
 	}
 
 	return result
+}
+
+// PruneDirtySet narrows a DirtySetResult by re-propagating reverse
+// dependencies only from targets whose hashes actually changed. The caller
+// must supply probeHashes — a map from "label\x00configuration" to the hex
+// hash computed at the destination revision — for every target in the
+// directly dirty packages. Targets whose probe hash matches the seed are
+// excluded from rdeps propagation, dramatically reducing the dirty set when
+// a BUILD.bazel change doesn't affect most existing targets (e.g. adding a
+// new target to a high-fanout package).
+//
+// seedHashes is the TargetHashes map from the seed file (label → config → hex hash).
+// edges is the TargetEdges map from the seed file.
+// original is the DirtySetResult from ComputeDirtySet.
+// probeHashes maps "label\x00config" → hex hash for targets in dirty packages.
+//
+// PruneDirtySet preserves the original DirtyLabels and DirtyPackages
+// (packages still need re-listing via wildcards) but recomputes
+// DirtyStarLabels from scratch.
+func PruneDirtySet(
+	original *DirtySetResult,
+	seedHashes map[string]map[string]string,
+	edges map[string][]string,
+	probeHashes map[string]string,
+) *DirtySetResult {
+	actuallyChanged := findChangedTargets(original.DirtyLabels, seedHashes, probeHashes)
+	newDirtyStar := propagateFrom(original.DirtyLabels, actuallyChanged, edges)
+
+	return &DirtySetResult{
+		DirtyLabels:     original.DirtyLabels,
+		DirtyStarLabels: newDirtyStar,
+		DirtyPackages:   original.DirtyPackages,
+	}
+}
+
+// findChangedTargets returns the subset of dirtyLabels whose probe hash
+// differs from the seed. New targets (absent from seed) and targets absent
+// from probe results are treated as changed.
+func findChangedTargets(
+	dirtyLabels map[string]bool,
+	seedHashes map[string]map[string]string,
+	probeHashes map[string]string,
+) map[string]bool {
+	changed := make(map[string]bool)
+	for label := range dirtyLabels {
+		if targetHashChanged(label, seedHashes[label], probeHashes) {
+			changed[label] = true
+		}
+	}
+	return changed
+}
+
+// targetHashChanged reports whether a single target's probe hash differs
+// from its seed hash. Returns true for new targets (nil seedConfigs) and
+// targets missing from probe results.
+func targetHashChanged(label string, seedConfigs map[string]string, probeHashes map[string]string) bool {
+	if seedConfigs == nil {
+		return true
+	}
+	for config, seedHex := range seedConfigs {
+		probeHex, ok := probeHashes[label+"\x00"+config]
+		if !ok || probeHex != seedHex {
+			return true
+		}
+	}
+	return false
+}
+
+// propagateFrom builds DirtyStarLabels by including all directly dirty
+// labels and BFS-propagating rdeps only from the actuallyChanged subset.
+func propagateFrom(dirtyLabels, actuallyChanged map[string]bool, edges map[string][]string) map[string]bool {
+	rdeps := BuildRdeps(edges)
+	result := make(map[string]bool, len(actuallyChanged))
+
+	for label := range dirtyLabels {
+		result[label] = true
+	}
+
+	queue := make([]string, 0, len(actuallyChanged))
+	for label := range actuallyChanged {
+		queue = append(queue, label)
+	}
+	for len(queue) > 0 {
+		current := queue[0]
+		queue = queue[1:]
+		for _, rdep := range rdeps[current] {
+			if !result[rdep] {
+				result[rdep] = true
+				queue = append(queue, rdep)
+			}
+		}
+	}
+	return result
+}
+
+// ProbeHashesFromQueryResults extracts hex-encoded hashes for all matching
+// targets in a QueryResults, keyed as "label\x00configuration". This is
+// used by the probe phase to compare against seed hashes.
+func ProbeHashesFromQueryResults(queryResults *QueryResults) (map[string]string, error) {
+	hashes := make(map[string]string)
+	for _, label := range queryResults.MatchingTargets.Labels() {
+		for _, cfg := range queryResults.MatchingTargets.ConfigurationsFor(label) {
+			hash, err := queryResults.TargetHashCache.Hash(LabelAndConfiguration{
+				Label: label, Configuration: cfg,
+			})
+			if err != nil {
+				return nil, err
+			}
+			hashes[label.String()+"\x00"+cfg.String()] = hex.EncodeToString(hash)
+		}
+	}
+	return hashes, nil
 }
 
 func isFallbackTrigger(basename string) bool {
