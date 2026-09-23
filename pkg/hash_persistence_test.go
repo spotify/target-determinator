@@ -375,9 +375,14 @@ func TestPersistenceModesPreserveHashesAndGeneratedFileEdges(t *testing.T) {
 			t.Fatalf("seedable hashes for %s differ from legacy: seedable=%v legacy=%v", label, seedableConfigs, legacyConfigs)
 		}
 	}
-	// The generated file output should now have a hash in seedable mode.
-	if _, ok := seedable.TargetHashes[outputLabel.String()]; !ok {
-		t.Fatal("seedable hashes should include dependency-only target //gen:output")
+	// The generated file's hash belongs in DependencyHashes, never in
+	// TargetHashes: diffing compares the target set, so a dependency label
+	// appearing there surfaces as a spurious added target.
+	if _, ok := seedable.DependencyHashes[outputLabel.String()]; !ok {
+		t.Fatal("seedable output should record //gen:output in DependencyHashes")
+	}
+	if _, ok := seedable.TargetHashes[outputLabel.String()]; ok {
+		t.Fatal("//gen:output must not leak into TargetHashes")
 	}
 }
 
@@ -403,16 +408,19 @@ func TestAddDependencyHashesCoversEdgeKeysAndDependencyValues(t *testing.T) {
 		"//pkg:already": {"": "preexisting"},
 	}
 
-	AddDependencyHashes(targetHashes, edges, cache)
+	dependencyHashes := ExtractDependencyHashes(targetHashes, edges, cache)
 
-	if got := targetHashes["//pkg:rule"][""]; got != hex.EncodeToString(filled(0x11)) {
+	if got := dependencyHashes["//pkg:rule"][""]; got != hex.EncodeToString(filled(0x11)) {
 		t.Errorf("edge key //pkg:rule not added, got %q", got)
 	}
-	if got := targetHashes["//pkg:leaf.txt"][""]; got != hex.EncodeToString(filled(0x22)) {
+	if got := dependencyHashes["//pkg:leaf.txt"][""]; got != hex.EncodeToString(filled(0x22)) {
 		t.Errorf("dependency-value-only //pkg:leaf.txt not added, got %q", got)
 	}
 	if got := targetHashes["//pkg:already"][""]; got != "preexisting" {
 		t.Errorf("existing hash overwritten with %q", got)
+	}
+	if _, ok := dependencyHashes["//pkg:already"]; ok {
+		t.Error("a label already in targetHashes must not be duplicated into dependencyHashes")
 	}
 }
 
@@ -428,15 +436,14 @@ func TestAddDependencyHashesSkipsEmptyHashSentinel(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	targetHashes := map[string]map[string]string{}
-	AddDependencyHashes(targetHashes, map[string][]string{
+	dependencyHashes := ExtractDependencyHashes(map[string]map[string]string{}, map[string][]string{
 		"//pkg:real": {"//pkg:missing"},
 	}, cache)
 
-	if _, ok := targetHashes["//pkg:real"]; !ok {
+	if _, ok := dependencyHashes["//pkg:real"]; !ok {
 		t.Error("//pkg:real should have been added")
 	}
-	if got, ok := targetHashes["//pkg:missing"]; ok {
+	if got, ok := dependencyHashes["//pkg:missing"]; ok {
 		t.Errorf("empty-hash sentinel should not be persisted, got %v", got)
 	}
 }

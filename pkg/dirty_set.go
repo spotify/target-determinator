@@ -194,13 +194,12 @@ type ProbeResult struct {
 // re-listing via wildcards — and only DirtyStarLabels is recomputed.
 func PruneDirtySet(
 	original *DirtySetResult,
-	seedHashes map[string]map[string]string,
-	edges map[string][]string,
+	seed *PersistedHashData,
 	probe ProbeResult,
 	changedFiles map[string]string,
 ) *DirtySetResult {
-	actuallyChanged := findChangedTargets(original.DirtyLabels, seedHashes, probe, changedFiles)
-	newDirtyStar := propagateFrom(original.DirtyLabels, actuallyChanged, edges)
+	actuallyChanged := findChangedTargets(original.DirtyLabels, seed, probe, changedFiles)
+	newDirtyStar := propagateFrom(original.DirtyLabels, actuallyChanged, seed.TargetEdges)
 
 	return &DirtySetResult{
 		DirtyLabels:     original.DirtyLabels,
@@ -213,7 +212,7 @@ func PruneDirtySet(
 // the seed and the destination revision.
 func findChangedTargets(
 	dirtyLabels map[string]bool,
-	seedHashes map[string]map[string]string,
+	seed *PersistedHashData,
 	probe ProbeResult,
 	changedFiles map[string]string,
 ) map[string]bool {
@@ -225,7 +224,7 @@ func findChangedTargets(
 			}
 			continue
 		}
-		if targetHashChanged(label, seedHashes[label], probe.Hashes) {
+		if targetHashChanged(label, seed.SeedHashes(label), probe.Hashes) {
 			changed[label] = true
 		}
 	}

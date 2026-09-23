@@ -273,6 +273,9 @@ func runSeeded(cfg *config) (seededOutcome, error) {
 			seedData.TargetEdges,
 			seedData.SeedCompatibilityFingerprint,
 		)
+		if cfg.SeedableOutput {
+			persistedData.DependencyHashes = seedData.DependencyHashes
+		}
 		if err := pkg.WritePersistedData(cfg.OutputFile, persistedData); err != nil {
 			return seededOutcome{}, fmt.Errorf("failed to persist hashes: %w", err)
 		}
@@ -425,7 +428,7 @@ func probePruneDirtySet(
 		time.Since(phaseStart), len(probe.Hashes), len(probe.SourceFiles),
 		len(dirtyResult.DirtyPackages))
 
-	return pkg.PruneDirtySet(dirtyResult, seedData.TargetHashes, seedData.TargetEdges, probe, changedFiles), nil
+	return pkg.PruneDirtySet(dirtyResult, seedData, probe, changedFiles), nil
 }
 
 // probePackages queries and hashes targets in the given packages, seeding
@@ -505,16 +508,18 @@ func buildExternalSeedHashes(
 		dirtyPkgSet[p] = true
 	}
 	hashes := make(map[string][]byte)
-	for label, configMap := range seedData.TargetHashes {
-		if dirtyPkgSet[pkg.LabelPackage(label)] {
-			continue
-		}
-		for configStr, hashHex := range configMap {
-			hashBytes, err := hex.DecodeString(hashHex)
-			if err != nil {
-				return nil, fmt.Errorf("invalid seed hash for %s: %w", label, err)
+	for _, source := range []map[string]map[string]string{seedData.TargetHashes, seedData.DependencyHashes} {
+		for label, configMap := range source {
+			if dirtyPkgSet[pkg.LabelPackage(label)] {
+				continue
 			}
-			hashes[label+"\x00"+configStr] = hashBytes
+			for configStr, hashHex := range configMap {
+				hashBytes, err := hex.DecodeString(hashHex)
+				if err != nil {
+					return nil, fmt.Errorf("invalid seed hash for %s: %w", label, err)
+				}
+				hashes[label+"\x00"+configStr] = hashBytes
+			}
 		}
 	}
 	return hashes, nil
@@ -561,19 +566,24 @@ func validateSeed(seedData *pkg.PersistedHashData, expectedSha, expectedFingerpr
 
 func reusableSeedHashes(seedData *pkg.PersistedHashData, dirtyLabels map[string]bool) (map[string][]byte, error) {
 	hashes := make(map[string][]byte)
-	for label, configMap := range seedData.TargetHashes {
-		if dirtyLabels[label] {
-			continue
-		}
-		for configStr, hashHex := range configMap {
-			hashBytes, err := hex.DecodeString(hashHex)
-			if err != nil {
-				return nil, fmt.Errorf("invalid hash hex for %s: %w", label, err)
+	// Dependency hashes are as reusable as target hashes for seeding the
+	// cache; they are only kept in a separate bucket so that diffing sees
+	// the target set alone.
+	for _, source := range []map[string]map[string]string{seedData.TargetHashes, seedData.DependencyHashes} {
+		for label, configMap := range source {
+			if dirtyLabels[label] {
+				continue
 			}
-			if len(hashBytes) != sha256.Size {
-				return nil, fmt.Errorf("invalid hash length for %s: got %d bytes, want %d", label, len(hashBytes), sha256.Size)
+			for configStr, hashHex := range configMap {
+				hashBytes, err := hex.DecodeString(hashHex)
+				if err != nil {
+					return nil, fmt.Errorf("invalid hash hex for %s: %w", label, err)
+				}
+				if len(hashBytes) != sha256.Size {
+					return nil, fmt.Errorf("invalid hash length for %s: got %d bytes, want %d", label, len(hashBytes), sha256.Size)
+				}
+				hashes[label+"\x00"+configStr] = hashBytes
 			}
-			hashes[label+"\x00"+configStr] = hashBytes
 		}
 	}
 	return hashes, nil
@@ -618,7 +628,7 @@ func mergePersistedData(
 		}
 	}
 	mergedEdges := mergePersistedEntries(seedData.TargetEdges, dirtyLabels, freshEdges)
-	pkg.AddDependencyHashes(persistedData.TargetHashes, mergedEdges, queryResults.TargetHashCache)
+	persistedData.DependencyHashes = pkg.ExtractDependencyHashes(persistedData.TargetHashes, mergedEdges, queryResults.TargetHashCache)
 	persistedData.FormatVersion = pkg.CurrentPersistedHashFormatVersion
 	persistedData.SeedCompatibilityFingerprint = compatibilityFingerprint
 	persistedData.TargetEdges = mergedEdges

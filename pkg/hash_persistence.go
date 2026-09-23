@@ -43,8 +43,23 @@ type PersistedHashData struct {
 	// independent) because CI uses --query-backend=query with a single null
 	// configuration.
 	TargetEdges map[string][]string `json:"target_edges,omitempty"`
+	// DependencyHashes holds hashes for labels that appear in TargetEdges
+	// without being matching targets, such as manual-tagged deps and
+	// platform() rules. Incremental hashing needs them to tell whether such
+	// a label changed, but they are not part of the target set and must
+	// stay out of TargetHashes, which is what diffing compares.
+	DependencyHashes map[string]map[string]string `json:"dependency_hashes,omitempty"`
 	// Metadata contains additional information about the computation
 	Metadata HashMetadata `json:"metadata"`
+}
+
+// SeedHashes returns the recorded per-configuration hashes for a label,
+// whether it was persisted as a matching target or as a dependency.
+func (d *PersistedHashData) SeedHashes(label string) map[string]string {
+	if hashes, ok := d.TargetHashes[label]; ok {
+		return hashes
+	}
+	return d.DependencyHashes[label]
 }
 
 // SeedCompatibility describes every invocation-level input that must remain
@@ -183,7 +198,7 @@ func persistHashes(filePath string, gitCommitSha string, queryResults *QueryResu
 		if err != nil {
 			return fmt.Errorf("failed to extract target edges: %w", err)
 		}
-		AddDependencyHashes(targetHashes, targetEdges, queryResults.TargetHashCache)
+		persistedData.DependencyHashes = ExtractDependencyHashes(targetHashes, targetEdges, queryResults.TargetHashCache)
 		compatibilityFingerprint, err := ComputeSeedCompatibilityFingerprint(context, targetsPattern, queryResults.BazelRelease)
 		if err != nil {
 			return err
@@ -196,17 +211,21 @@ func persistHashes(filePath string, gitCommitSha string, queryResults *QueryResu
 	return writePersistedData(filePath, &persistedData, !seedable)
 }
 
-// AddDependencyHashes supplements targetHashes with hashes for labels that
-// appear in the edge map but are not matching targets — manual-tagged deps,
-// platform() rules, generated file outputs. Their hashes were already
-// computed in the cache via recursive Hash() calls, so persisting them is
-// free, and without them incremental hashing cannot tell whether such a
-// label changed and must conservatively propagate its reverse dependencies.
+// ExtractDependencyHashes returns hashes for labels that appear in the edge
+// map but are not matching targets — manual-tagged deps, platform() rules,
+// generated file outputs. Their hashes were already computed in the cache
+// via recursive Hash() calls, so recording them is free, and without them
+// incremental hashing cannot tell whether such a label changed and must
+// conservatively propagate its reverse dependencies.
+//
+// They are returned separately rather than merged into targetHashes: only
+// matching targets belong in the target set that diffing compares, and
+// mixing these in makes them surface as spurious added targets.
 //
 // Source files are deliberately excluded. The git diff already says whether
 // a file changed, so hashing one to rediscover that is redundant, and they
 // outnumber the labels that do need a hash by more than twenty to one.
-func AddDependencyHashes(targetHashes map[string]map[string]string, edges map[string][]string, cache *TargetHashCache) {
+func ExtractDependencyHashes(targetHashes map[string]map[string]string, edges map[string][]string, cache *TargetHashCache) map[string]map[string]string {
 	sourceFiles := cache.SourceFileLabels()
 
 	// Both edge keys and dependency values: leaf labels (npm /ref targets)
@@ -228,9 +247,10 @@ func AddDependencyHashes(targetHashes map[string]map[string]string, edges map[st
 		}
 	}
 	if len(wanted) == 0 {
-		return
+		return nil
 	}
 
+	dependencyHashes := make(map[string]map[string]string)
 	for key, hashHex := range cache.ExtractHexHashes() {
 		label, configuration, ok := splitHashKey(key)
 		if !ok || !wanted[label] {
@@ -245,13 +265,14 @@ func AddDependencyHashes(targetHashes map[string]map[string]string, edges map[st
 		if len(hashHex) != hex.EncodedLen(sha256.Size) {
 			continue
 		}
-		configs := targetHashes[label]
+		configs := dependencyHashes[label]
 		if configs == nil {
 			configs = make(map[string]string)
-			targetHashes[label] = configs
+			dependencyHashes[label] = configs
 		}
 		configs[configuration] = hashHex
 	}
+	return dependencyHashes
 }
 
 // WritePersistedData writes a PersistedHashData struct directly to a JSON file.
