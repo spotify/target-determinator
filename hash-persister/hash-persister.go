@@ -299,10 +299,17 @@ func runSeeded(cfg *config) (seededOutcome, error) {
 	// the seed and only propagate rdeps from targets that actually changed.
 	unprunedDirtyStarCount := len(dirtyResult.DirtyStarLabels)
 	if unprunedDirtyStarCount > len(dirtyResult.DirtyLabels) {
-		dirtyResult, err = probePruneDirtySet(cfg, commitRev, dirtyResult, seedData, changedFiles)
-		if err != nil {
-			log.Printf("Probe pruning failed, continuing with unpruned dirty set: %v", err)
+		// Kept in a temporary: probePruneDirtySet returns a nil result
+		// alongside its error, so assigning straight to dirtyResult would
+		// discard the set the fallback is supposed to carry on with.
+		pruned, probeErr := probePruneDirtySet(cfg, commitRev, dirtyResult, seedData, changedFiles)
+		if probeErr != nil {
+			log.Printf("Probe pruning failed, continuing with unpruned dirty set: %v", probeErr)
 		} else {
+			dirtyResult = pruned
+			// The report drives CI metrics, so it has to describe the set
+			// actually used rather than the one before pruning.
+			outcome.DirtyTargetCount = len(dirtyResult.DirtyStarLabels)
 			log.Printf("Probe pruning: %d dirty* -> %d dirty* (%d eliminated)",
 				unprunedDirtyStarCount, len(dirtyResult.DirtyStarLabels),
 				unprunedDirtyStarCount-len(dirtyResult.DirtyStarLabels))
