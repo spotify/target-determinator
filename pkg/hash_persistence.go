@@ -202,14 +202,24 @@ func persistHashes(filePath string, gitCommitSha string, queryResults *QueryResu
 // computed in the cache via recursive Hash() calls, so persisting them is
 // free, and without them incremental hashing cannot tell whether such a
 // label changed and must conservatively propagate its reverse dependencies.
+//
+// Source files are deliberately excluded. The git diff already says whether
+// a file changed, so hashing one to rediscover that is redundant, and they
+// outnumber the labels that do need a hash by more than twenty to one.
 func AddDependencyHashes(targetHashes map[string]map[string]string, edges map[string][]string, cache *TargetHashCache) {
-	// Both edge keys and dependency values: leaf labels (source files, npm
-	// /ref targets) never appear as keys, so iterating keys alone misses them.
+	sourceFiles := cache.SourceFileLabels()
+
+	// Both edge keys and dependency values: leaf labels (npm /ref targets)
+	// never appear as keys, so iterating keys alone misses them.
 	wanted := make(map[string]bool)
 	consider := func(label string) {
-		if _, ok := targetHashes[label]; !ok {
-			wanted[label] = true
+		if _, ok := targetHashes[label]; ok {
+			return
 		}
+		if sourceFiles[label] {
+			return
+		}
+		wanted[label] = true
 	}
 	for label, deps := range edges {
 		consider(label)

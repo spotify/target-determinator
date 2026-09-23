@@ -214,6 +214,22 @@ func (thc *TargetHashCache) ExtractHexHashes() map[string]string {
 	return hashes
 }
 
+// SourceFileLabels returns the labels in the cache's query context that are
+// source files. Whether a source file changed is answered by the git diff,
+// so these labels need neither a persisted hash nor a hash comparison.
+func (thc *TargetHashCache) SourceFileLabels() map[string]bool {
+	sourceFiles := make(map[string]bool)
+	for label, configurations := range thc.context {
+		for _, configuredTarget := range configurations {
+			if configuredTarget.GetTarget().GetType() == build.Target_SOURCE_FILE {
+				sourceFiles[label.String()] = true
+				break
+			}
+		}
+	}
+	return sourceFiles
+}
+
 // splitHashKey splits a "<label>\x00<configuration>" cache key.
 func splitHashKey(key string) (label, configuration string, ok bool) {
 	idx := strings.IndexByte(key, '\x00')

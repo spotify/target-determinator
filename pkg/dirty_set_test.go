@@ -502,7 +502,7 @@ func TestPruneDirtySetEliminatesUnchangedRdeps(t *testing.T) {
 		"//tools/binaries:new_tool\x00":      "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
 	}
 
-	pruned := PruneDirtySet(original, seedHashes, edges, probeHashes)
+	pruned := PruneDirtySet(original, seedHashes, edges, ProbeResult{Hashes: probeHashes}, nil)
 
 	// Directly dirty labels should be preserved.
 	if !pruned.DirtyStarLabels["//tools/binaries:existing_tool"] {
@@ -555,7 +555,7 @@ func TestPruneDirtySetPreservesChangedRdeps(t *testing.T) {
 		"//lib:src.java\x00": "cccc0000cccc0000cccc0000cccc0000cccc0000cccc0000cccc0000cccc0000",
 	}
 
-	pruned := PruneDirtySet(original, seedHashes, edges, probeHashes)
+	pruned := PruneDirtySet(original, seedHashes, edges, ProbeResult{Hashes: probeHashes}, nil)
 
 	if !pruned.DirtyStarLabels["//app:consumer"] {
 		t.Error("//app:consumer must remain dirty — its dep //lib:changed has a different hash")
@@ -583,10 +583,112 @@ func TestPruneDirtySetNoOpWhenAllChanged(t *testing.T) {
 		"//pkg:a\x00": "ffff0000ffff0000ffff0000ffff0000ffff0000ffff0000ffff0000ffff0000",
 	}
 
-	pruned := PruneDirtySet(original, seedHashes, edges, probeHashes)
+	pruned := PruneDirtySet(original, seedHashes, edges, ProbeResult{Hashes: probeHashes}, nil)
 
 	// Everything should remain dirty — same as unpruned.
 	if !pruned.DirtyStarLabels["//app:dep"] {
 		t.Error("//app:dep must remain dirty when //pkg:a changed")
+	}
+}
+
+func TestPruneDirtySetJudgesSourceFilesByGitNotHash(t *testing.T) {
+	// A source file carries no seed hash; the git diff decides. //pkg:kept.java
+	// is untouched so its consumer must not propagate, while //pkg:edited.java
+	// is in the diff so its consumer must.
+	edges := map[string][]string{
+		"//pkg:uses_kept":   {"//pkg:kept.java"},
+		"//pkg:uses_edited": {"//pkg:edited.java"},
+		"//app:via_kept":    {"//pkg:uses_kept"},
+		"//app:via_edited":  {"//pkg:uses_edited"},
+	}
+	allLabels := CollectAllLabels(edges, nil)
+	original := ComputeDirtySet(
+		map[string]string{"pkg/edited.java": "M"}, edges, allLabels, nil,
+	)
+
+	// Both source files are directly dirty before pruning, and both
+	// consumers are reachable from them.
+	for _, label := range []string{"//app:via_kept", "//app:via_edited"} {
+		if !original.DirtyStarLabels[label] {
+			t.Fatalf("expected %s in unpruned DirtyStarLabels", label)
+		}
+	}
+
+	// A consumer of a changed source file hashes differently, as it would
+	// in reality; the consumer of the untouched one does not.
+	unchanged := "aaaa0000aaaa0000aaaa0000aaaa0000aaaa0000aaaa0000aaaa0000aaaa0000"
+	differs := "ffff0000ffff0000ffff0000ffff0000ffff0000ffff0000ffff0000ffff0000"
+	seedHashes := map[string]map[string]string{
+		"//pkg:uses_kept":   {"": unchanged},
+		"//pkg:uses_edited": {"": unchanged},
+	}
+	probe := ProbeResult{
+		Hashes: map[string]string{
+			"//pkg:uses_kept\x00":   unchanged,
+			"//pkg:uses_edited\x00": differs,
+		},
+		SourceFiles: map[string]bool{
+			"//pkg:kept.java":   true,
+			"//pkg:edited.java": true,
+		},
+	}
+
+	pruned := PruneDirtySet(original, seedHashes, edges,
+		probe, map[string]string{"pkg/edited.java": "M"})
+
+	if pruned.DirtyStarLabels["//app:via_kept"] {
+		t.Error("//app:via_kept should be pruned: pkg/kept.java is not in the git diff")
+	}
+	if !pruned.DirtyStarLabels["//app:via_edited"] {
+		t.Error("//app:via_edited must stay dirty: pkg/edited.java is in the git diff")
+	}
+}
+
+func TestLabelToPath(t *testing.T) {
+	for _, tt := range []struct{ label, want string }{
+		{"//pkg:file.java", "pkg/file.java"},
+		{"//pkg:src/main/java/App.java", "pkg/src/main/java/App.java"},
+		{"//:root.txt", "root.txt"},
+		{"//a/b/c:d.txt", "a/b/c/d.txt"},
+		{"//pkg", "pkg"},
+	} {
+		if got := labelToPath(tt.label); got != tt.want {
+			t.Errorf("labelToPath(%q) = %q, want %q", tt.label, got, tt.want)
+		}
+	}
+}
+
+func TestPropagateTraversesThroughUnchangedDirtyLabels(t *testing.T) {
+	// //pkg:middle is dirty (its package changed) but its own hash did not
+	// change. It still has to be walked through, or //app:behind is lost.
+	// Membership of the result set must not double as "already traversed".
+	edges := map[string][]string{
+		"//pkg:changed": {"//pkg:src.java"},
+		"//pkg:middle":  {"//pkg:changed"},
+		"//app:behind":  {"//pkg:middle"},
+	}
+	allLabels := CollectAllLabels(edges, nil)
+	original := ComputeDirtySet(
+		map[string]string{"pkg/src.java": "M"}, edges, allLabels, nil,
+	)
+
+	unchanged := "bbbb0000bbbb0000bbbb0000bbbb0000bbbb0000bbbb0000bbbb0000bbbb0000"
+	seedHashes := map[string]map[string]string{
+		"//pkg:changed": {"": "cccc0000cccc0000cccc0000cccc0000cccc0000cccc0000cccc0000cccc0000"},
+		"//pkg:middle":  {"": unchanged},
+	}
+	probe := ProbeResult{
+		Hashes: map[string]string{
+			"//pkg:changed\x00": "dddd0000dddd0000dddd0000dddd0000dddd0000dddd0000dddd0000dddd0000",
+			"//pkg:middle\x00":  unchanged,
+		},
+		SourceFiles: map[string]bool{"//pkg:src.java": true},
+	}
+
+	pruned := PruneDirtySet(original, seedHashes, edges, probe,
+		map[string]string{"pkg/src.java": "M"})
+
+	if !pruned.DirtyStarLabels["//app:behind"] {
+		t.Error("//app:behind must be reached by traversing through the unchanged dirty label //pkg:middle")
 	}
 }

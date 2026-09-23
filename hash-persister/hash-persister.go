@@ -296,7 +296,7 @@ func runSeeded(cfg *config) (seededOutcome, error) {
 	// the seed and only propagate rdeps from targets that actually changed.
 	unprunedDirtyStarCount := len(dirtyResult.DirtyStarLabels)
 	if unprunedDirtyStarCount > len(dirtyResult.DirtyLabels) {
-		dirtyResult, err = probePruneDirtySet(cfg, commitRev, dirtyResult, seedData)
+		dirtyResult, err = probePruneDirtySet(cfg, commitRev, dirtyResult, seedData, changedFiles)
 		if err != nil {
 			log.Printf("Probe pruning failed, continuing with unpruned dirty set: %v", err)
 		} else {
@@ -413,28 +413,30 @@ func probePruneDirtySet(
 	commitRev pkg.LabelledGitRev,
 	dirtyResult *pkg.DirtySetResult,
 	seedData *pkg.PersistedHashData,
+	changedFiles map[string]string,
 ) (*pkg.DirtySetResult, error) {
 	phaseStart := time.Now()
 
-	probeHashes, err := probePackageHashes(cfg, commitRev, dirtyResult.DirtyPackages, seedData)
+	probe, err := probePackages(cfg, commitRev, dirtyResult.DirtyPackages, seedData)
 	if err != nil {
 		return nil, err
 	}
-	log.Printf("Phase probe completed in %v (%d targets in %d packages)",
-		time.Since(phaseStart), len(probeHashes), len(dirtyResult.DirtyPackages))
+	log.Printf("Phase probe completed in %v (%d hashed, %d source files, in %d packages)",
+		time.Since(phaseStart), len(probe.Hashes), len(probe.SourceFiles),
+		len(dirtyResult.DirtyPackages))
 
-	return pkg.PruneDirtySet(dirtyResult, seedData.TargetHashes, seedData.TargetEdges, probeHashes), nil
+	return pkg.PruneDirtySet(dirtyResult, seedData.TargetHashes, seedData.TargetEdges, probe, changedFiles), nil
 }
 
-// probePackageHashes queries and hashes targets in the given packages,
-// seeding dependency hashes from the seed file so that only the dirty
-// packages need a Bazel query.
-func probePackageHashes(
+// probePackages queries and hashes targets in the given packages, seeding
+// dependency hashes from the seed file so that only the dirty packages need
+// a Bazel query.
+func probePackages(
 	cfg *config,
 	commitRev pkg.LabelledGitRev,
 	dirtyPackages []string,
 	seedData *pkg.PersistedHashData,
-) (map[string]string, error) {
+) (pkg.ProbeResult, error) {
 	// Query the dirty packages raw, deliberately bypassing the targets
 	// pattern. That pattern excludes manual-tagged targets, which covers
 	// most labels in a dirty package (npm links, platform() rules, JS build
@@ -444,32 +446,35 @@ func probePackageHashes(
 	probePattern := buildProbePattern(dirtyPackages)
 	probeTargets, err := pkg.ParseTargetsList(probePattern)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse probe targets: %w", err)
+		return pkg.ProbeResult{}, fmt.Errorf("failed to parse probe targets: %w", err)
 	}
 
 	probeResults, probeCleanup, err := pkg.LoadIncompleteMetadata(cfg.Context, commitRev, probeTargets)
 	if err != nil {
 		probeCleanup()
-		return nil, fmt.Errorf("probe query failed: %w", err)
+		return pkg.ProbeResult{}, fmt.Errorf("probe query failed: %w", err)
 	}
 	defer probeCleanup()
 
 	probeSeedHashes, err := buildExternalSeedHashes(seedData, dirtyPackages)
 	if err != nil {
-		return nil, err
+		return pkg.ProbeResult{}, err
 	}
 	if err := probeResults.TargetHashCache.SeedHashes(probeSeedHashes); err != nil {
-		return nil, fmt.Errorf("cannot seed probe hashes: %w", err)
+		return pkg.ProbeResult{}, fmt.Errorf("cannot seed probe hashes: %w", err)
 	}
 
 	if err := probeResults.PrefillCache(); err != nil {
-		return nil, fmt.Errorf("probe hashing failed: %w", err)
+		return pkg.ProbeResult{}, fmt.Errorf("probe hashing failed: %w", err)
 	}
 
-	// Read straight from the cache rather than from MatchingTargets: it
-	// additionally holds the transitively-computed hashes of dependencies
+	// Read hashes straight from the cache rather than from MatchingTargets:
+	// it additionally holds the transitively-computed hashes of dependencies
 	// outside the probed packages, which cost nothing extra to include.
-	return probeResults.TargetHashCache.ExtractHexHashes(), nil
+	return pkg.ProbeResult{
+		Hashes:      probeResults.TargetHashCache.ExtractHexHashes(),
+		SourceFiles: probeResults.TargetHashCache.SourceFileLabels(),
+	}, nil
 }
 
 // buildProbePattern returns a bazel query expression covering every target
