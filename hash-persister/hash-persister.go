@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/bazel-contrib/target-determinator/cli"
@@ -434,11 +435,13 @@ func probePackageHashes(
 	dirtyPackages []string,
 	seedData *pkg.PersistedHashData,
 ) (map[string]string, error) {
-	probeUniverse := pkg.BuildScopedUniverse(dirtyPackages, nil)
-	probePattern, err := pkg.ScopeTargetsPattern(cfg.Targets.String(), probeUniverse)
-	if err != nil {
-		return nil, fmt.Errorf("cannot scope probe pattern: %w", err)
-	}
+	// Query the dirty packages raw, deliberately bypassing the targets
+	// pattern. That pattern excludes manual-tagged targets, which covers
+	// most labels in a dirty package (npm links, platform() rules, JS build
+	// internals). Those labels still appear in the seed's edge map, so the
+	// probe must hash them to prove they are unchanged. ":*" rather than
+	// ":all" so source files are included too.
+	probePattern := buildProbePattern(dirtyPackages)
 	probeTargets, err := pkg.ParseTargetsList(probePattern)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse probe targets: %w", err)
@@ -468,6 +471,23 @@ func probePackageHashes(
 	// ProbeHashesFromQueryResults only returns matching targets; the cache
 	// also has hashes for their deps computed during PrefillCache.
 	return pkg.ProbeHashesFromCache(probeResults)
+}
+
+// buildProbePattern returns a bazel query expression covering every target
+// in the given packages, including manual-tagged rules and source files.
+func buildProbePattern(dirtyPackages []string) string {
+	if len(dirtyPackages) == 0 {
+		return "set()"
+	}
+	terms := make([]string, 0, len(dirtyPackages))
+	for _, p := range dirtyPackages {
+		if p == "//" {
+			terms = append(terms, "//:*")
+		} else {
+			terms = append(terms, p+":*")
+		}
+	}
+	return "(" + strings.Join(terms, " + ") + ")"
 }
 
 // buildExternalSeedHashes collects seed hashes for all targets NOT in the

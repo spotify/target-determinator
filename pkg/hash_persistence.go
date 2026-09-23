@@ -220,12 +220,21 @@ func AddDependencyHashes(targetHashes map[string]map[string]string, edges map[st
 		cachedByLabel[label][config] = hex.EncodeToString(hashBytes)
 	}
 
-	for label := range edges {
+	add := func(label string) {
 		if _, ok := targetHashes[label]; ok {
-			continue
+			return
 		}
 		if configs, ok := cachedByLabel[label]; ok {
 			targetHashes[label] = configs
+		}
+	}
+	// Cover both edge keys and dependency values. Leaf labels (source files,
+	// npm /ref targets) never appear as keys, so iterating keys alone would
+	// miss them and leave the probe unable to compare their hashes.
+	for label, deps := range edges {
+		add(label)
+		for _, dep := range deps {
+			add(dep)
 		}
 	}
 }
