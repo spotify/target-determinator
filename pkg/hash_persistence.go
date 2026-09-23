@@ -5,7 +5,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"log"
 	"os"
 	"slices"
 	"sort"
@@ -181,7 +180,6 @@ func PersistSeedableHashes(filePath string, gitCommitSha string, queryResults *Q
 }
 
 func persistHashes(filePath string, gitCommitSha string, queryResults *QueryResults, context *Context, targetsPattern string, seedable bool) error {
-	stepStart := time.Now()
 	targetHashes := make(map[string]map[string]string)
 	totalTargets := 0
 
@@ -204,8 +202,6 @@ func persistHashes(filePath string, gitCommitSha string, queryResults *QueryResu
 		}
 	}
 
-	log.Printf("Persist step collect-hashes completed in %v (%d hashes)", time.Since(stepStart), totalTargets)
-
 	persistedData := PersistedHashData{
 		GitCommitSha: gitCommitSha,
 		Timestamp:    time.Now(),
@@ -219,17 +215,11 @@ func persistHashes(filePath string, gitCommitSha string, queryResults *QueryResu
 	}
 
 	if seedable {
-		stepStart = time.Now()
 		targetEdges, err := ExtractEdges(queryResults)
 		if err != nil {
 			return fmt.Errorf("failed to extract target edges: %w", err)
 		}
-		log.Printf("Persist step extract-edges completed in %v (%d edges)", time.Since(stepStart), len(targetEdges))
-
-		stepStart = time.Now()
 		persistedData.DependencyHashes = ExtractDependencyHashes(targetHashes, targetEdges, queryResults.TargetHashCache)
-		log.Printf("Persist step dependency-hashes completed in %v (%d hashes)", time.Since(stepStart), len(persistedData.DependencyHashes))
-
 		compatibilityFingerprint, err := ComputeSeedCompatibilityFingerprint(context, targetsPattern, queryResults.BazelRelease)
 		if err != nil {
 			return err
@@ -314,35 +304,19 @@ func WritePersistedData(filePath string, data *PersistedHashData) error {
 }
 
 func writePersistedData(filePath string, data *PersistedHashData, pretty bool) error {
-	// Marshalling and writing are timed apart so that a slow persist phase
-	// can be attributed to formatting or to disk rather than guessed at.
-	// This mirrors what json.Encoder does internally: marshal the whole
-	// document into one buffer, then issue a single write.
-	marshalStart := time.Now()
-	var encoded []byte
-	var err error
-	if pretty {
-		encoded, err = json.MarshalIndent(data, "", "  ")
-	} else {
-		encoded, err = json.Marshal(data)
-	}
-	if err != nil {
-		return fmt.Errorf("failed to encode hash data to %s: %w", filePath, err)
-	}
-	encoded = append(encoded, '\n')
-	log.Printf("Persist step marshal completed in %v (%.1f MB)",
-		time.Since(marshalStart), float64(len(encoded))/1e6)
-
-	writeStart := time.Now()
 	file, err := os.Create(filePath)
 	if err != nil {
 		return fmt.Errorf("failed to create hash file %s: %w", filePath, err)
 	}
 	defer file.Close()
-	if _, err := file.Write(encoded); err != nil {
-		return fmt.Errorf("failed to write hash data to %s: %w", filePath, err)
+
+	encoder := json.NewEncoder(file)
+	if pretty {
+		encoder.SetIndent("", "  ")
 	}
-	log.Printf("Persist step write completed in %v", time.Since(writeStart))
+	if err := encoder.Encode(data); err != nil {
+		return fmt.Errorf("failed to encode hash data to %s: %w", filePath, err)
+	}
 	return nil
 }
 
