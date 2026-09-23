@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"slices"
 	"sort"
 	"time"
 
@@ -105,43 +106,63 @@ type HashMetadata struct {
 // making the graph conservative. Because seeded mode is query-only in normal
 // operation, each label ordinarily has a single null configuration.
 func ExtractEdges(queryResults *QueryResults) (map[string][]string, error) {
-	edgeSets := make(map[string]map[string]struct{})
 	edges := make(map[string][]string)
+
+	// Rule inputs arrive as strings and leave as strings, but each one has
+	// to be canonicalised in between, which parses it into a Label and
+	// formats it back. There are an order of magnitude more occurrences
+	// than distinct labels, so canonicalise each distinct string once.
+	//
+	// Shortcutting on the label's shape instead would be wrong: "//pkg:pkg"
+	// canonicalises to "//pkg", and skipping that would produce labels
+	// inconsistent with how matching targets are recorded.
+	canonical := make(map[string]string)
+	canonicalise := func(input string) (string, error) {
+		if cached, ok := canonical[input]; ok {
+			return cached, nil
+		}
+		parsed, err := queryResults.TargetHashCache.ParseCanonicalLabel(input)
+		if err != nil {
+			return "", err
+		}
+		result := parsed.String()
+		canonical[input] = result
+		return result, nil
+	}
 
 	for lbl, configMap := range queryResults.TransitiveConfiguredTargets {
 		lblStr := lbl.String()
 		for _, ct := range configMap {
 			target := ct.GetTarget()
-			var dependencyLabels []gazelle_label.Label
+			var dependencies []string
 			switch target.GetType() {
 			case build.Target_RULE:
-				var err error
-				dependencyLabels, err = canonicalRuleInputLabels(queryResults.TargetHashCache, target.GetRule())
-				if err != nil {
-					return nil, fmt.Errorf("failed to extract dependencies of %s: %w", lblStr, err)
+				for _, input := range target.GetRule().RuleInput {
+					dep, err := canonicalise(input)
+					if err != nil {
+						return nil, fmt.Errorf("failed to extract dependencies of %s: %w", lblStr, err)
+					}
+					dependencies = append(dependencies, dep)
 				}
 			case build.Target_GENERATED_FILE:
 				generatingRule, err := canonicalGeneratingRuleLabel(queryResults.TargetHashCache, target.GetGeneratedFile())
 				if err != nil {
 					return nil, fmt.Errorf("failed to extract dependencies of %s: %w", lblStr, err)
 				}
-				dependencyLabels = append(dependencyLabels, generatingRule)
+				dependencies = append(dependencies, generatingRule.String())
 			}
-			if len(dependencyLabels) > 0 {
-				if edgeSets[lblStr] == nil {
-					edgeSets[lblStr] = make(map[string]struct{})
-				}
-				for _, dep := range dependencyLabels {
-					edgeSets[lblStr][dep.String()] = struct{}{}
-				}
+			if len(dependencies) > 0 {
+				edges[lblStr] = append(edges[lblStr], dependencies...)
 			}
 		}
 	}
-	for lbl, deps := range edgeSets {
-		for dep := range deps {
-			edges[lbl] = append(edges[lbl], dep)
-		}
-		sort.Strings(edges[lbl])
+
+	// Deduplicating by sorting and compacting, rather than through a set,
+	// avoids hashing every dependency string. The result is sorted either
+	// way, and a label may repeat across configurations.
+	for lbl, deps := range edges {
+		sort.Strings(deps)
+		edges[lbl] = slices.Compact(deps)
 	}
 	return edges, nil
 }

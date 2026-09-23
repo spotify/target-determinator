@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -445,5 +446,83 @@ func TestAddDependencyHashesSkipsEmptyHashSentinel(t *testing.T) {
 	}
 	if got, ok := dependencyHashes["//pkg:missing"]; ok {
 		t.Errorf("empty-hash sentinel should not be persisted, got %v", got)
+	}
+}
+
+func TestExtractEdgesOmitsTargetsWithoutDependencies(t *testing.T) {
+	// A dependency-less target must not appear in the edge map at all.
+	// Appending an empty slice would create the key with a nil value,
+	// which serialises as null and inflates the artifact.
+	configuration := NormalizeConfiguration("")
+	leaf := mustParseLabel("//pkg:leaf")
+	consumer := mustParseLabel("//pkg:consumer")
+	transitive := map[gazelle_label.Label]map[Configuration]*analysis.ConfiguredTarget{
+		leaf: {configuration: {Target: &build.Target{
+			Type: build.Target_RULE.Enum(),
+			Rule: &build.Rule{Name: proto.String(leaf.String()), RuleClass: proto.String("filegroup")},
+		}}},
+		consumer: {configuration: {Target: &build.Target{
+			Type: build.Target_RULE.Enum(),
+			Rule: &build.Rule{
+				Name: proto.String(consumer.String()), RuleClass: proto.String("java_library"),
+				// The same input twice: deduplication must survive the
+				// switch from a set to sort-and-compact.
+				RuleInput: []string{leaf.String(), leaf.String()},
+			},
+		}}},
+	}
+	queryResults := &QueryResults{
+		TransitiveConfiguredTargets: transitive,
+		TargetHashCache:             NewTargetHashCache(transitive, &Normalizer{}, "release 8.0.0", true, nil),
+	}
+
+	edges, err := ExtractEdges(queryResults)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, ok := edges[leaf.String()]; ok {
+		t.Errorf("dependency-less %s should be absent, got %v", leaf, edges[leaf.String()])
+	}
+	if got := edges[consumer.String()]; len(got) != 1 || got[0] != leaf.String() {
+		t.Errorf("consumer edges = %v, want exactly one %s", got, leaf)
+	}
+}
+
+func TestExtractEdgesCanonicalisesRepeatedLabelsConsistently(t *testing.T) {
+	// The canonicalisation memo must return what parsing would, including
+	// for "//pkg:pkg", which canonicalises to "//pkg". Shortcutting on the
+	// label's shape would break this.
+	configuration := NormalizeConfiguration("")
+	consumer := mustParseLabel("//app:consumer")
+	transitive := map[gazelle_label.Label]map[Configuration]*analysis.ConfiguredTarget{
+		consumer: {configuration: {Target: &build.Target{
+			Type: build.Target_RULE.Enum(),
+			Rule: &build.Rule{
+				Name: proto.String(consumer.String()), RuleClass: proto.String("java_library"),
+				RuleInput: []string{"//pkg:pkg", "@//other:thing", "//pkg:pkg"},
+			},
+		}}},
+	}
+	queryResults := &QueryResults{
+		TransitiveConfiguredTargets: transitive,
+		TargetHashCache:             NewTargetHashCache(transitive, &Normalizer{}, "release 8.0.0", true, nil),
+	}
+
+	edges, err := ExtractEdges(queryResults)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	normalizer := &Normalizer{}
+	for _, input := range []string{"//pkg:pkg", "@//other:thing"} {
+		parsed, err := normalizer.ParseCanonicalLabel(input)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !slices.Contains(edges[consumer.String()], parsed.String()) {
+			t.Errorf("%q should appear canonicalised as %q, got %v",
+				input, parsed.String(), edges[consumer.String()])
+		}
 	}
 }
