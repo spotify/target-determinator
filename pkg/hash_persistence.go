@@ -1,14 +1,12 @@
 package pkg
 
 import (
-	"bufio"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
 	"sort"
-	"strconv"
 	"time"
 
 	"github.com/bazel-contrib/target-determinator/third_party/protobuf/bazel/build"
@@ -291,193 +289,14 @@ func writePersistedData(filePath string, data *PersistedHashData, pretty bool) e
 	}
 	defer file.Close()
 
+	encoder := json.NewEncoder(file)
 	if pretty {
-		// The legacy artifact is two orders of magnitude smaller than a
-		// seedable one, so the encoder's buffering costs little here and
-		// indenting by hand would not earn its keep.
-		encoder := json.NewEncoder(file)
 		encoder.SetIndent("", "  ")
-		if err := encoder.Encode(data); err != nil {
-			return fmt.Errorf("failed to encode hash data to %s: %w", filePath, err)
-		}
-		return nil
 	}
-
-	writer := bufio.NewWriterSize(file, 1<<20)
-	if err := streamPersistedData(writer, data); err != nil {
+	if err := encoder.Encode(data); err != nil {
 		return fmt.Errorf("failed to encode hash data to %s: %w", filePath, err)
 	}
-	if err := writer.Flush(); err != nil {
-		return fmt.Errorf("failed to flush hash data to %s: %w", filePath, err)
-	}
 	return nil
-}
-
-// streamPersistedData writes data as JSON incrementally.
-//
-// encoding/json marshals a whole value into one in-memory buffer before
-// writing a byte of it, and grows that buffer by doubling. A seedable
-// artifact is over a gigabyte, so that means gigabytes of allocation and
-// copying, and a peak resident size around twice the output. Emitting the
-// large maps entry by entry keeps memory flat.
-//
-// Map keys are sorted, matching encoding/json, so the artifact stays
-// reproducible.
-func streamPersistedData(writer *bufio.Writer, data *PersistedHashData) error {
-	out := &jsonWriter{w: writer}
-	out.raw("{")
-	// Fields are emitted in struct order, and the omitempty ones are
-	// skipped on the same conditions encoding/json would apply, so the
-	// legacy shape is unchanged.
-	if data.FormatVersion != 0 {
-		out.key("format_version")
-		out.raw(strconv.Itoa(data.FormatVersion))
-		out.raw(",")
-	}
-	if data.SeedCompatibilityFingerprint != "" {
-		out.key("seed_compatibility_fingerprint")
-		out.str(data.SeedCompatibilityFingerprint)
-		out.raw(",")
-	}
-	out.key("git_commit_sha")
-	out.str(data.GitCommitSha)
-	out.raw(",")
-	out.key("timestamp")
-	out.marshal(data.Timestamp)
-	out.raw(",")
-	out.key("bazel_release")
-	out.str(data.BazelRelease)
-	out.raw(",")
-	out.key("target_hashes")
-	out.hashes(data.TargetHashes)
-	if len(data.TargetEdges) > 0 {
-		out.raw(",")
-		out.key("target_edges")
-		out.edges(data.TargetEdges)
-	}
-	if len(data.DependencyHashes) > 0 {
-		out.raw(",")
-		out.key("dependency_hashes")
-		out.hashes(data.DependencyHashes)
-	}
-	out.raw(",")
-	out.key("metadata")
-	out.marshal(data.Metadata)
-	out.raw("}\n")
-	return out.err
-}
-
-// jsonWriter emits JSON to a buffered writer, holding the first error so
-// that callers need not check after every token.
-type jsonWriter struct {
-	w   *bufio.Writer
-	err error
-}
-
-func (j *jsonWriter) raw(s string) {
-	if j.err != nil {
-		return
-	}
-	_, j.err = j.w.WriteString(s)
-}
-
-func (j *jsonWriter) key(name string) {
-	j.str(name)
-	j.raw(":")
-}
-
-// str writes a JSON string. Labels and hex hashes never need escaping, so
-// the common path is a straight copy; anything else defers to the stdlib
-// rather than reimplementing its escaping rules.
-func (j *jsonWriter) str(s string) {
-	if j.err != nil {
-		return
-	}
-	if !needsJSONEscape(s) {
-		j.raw(`"`)
-		j.raw(s)
-		j.raw(`"`)
-		return
-	}
-	j.marshal(s)
-}
-
-func (j *jsonWriter) marshal(v any) {
-	if j.err != nil {
-		return
-	}
-	encoded, err := json.Marshal(v)
-	if err != nil {
-		j.err = err
-		return
-	}
-	_, j.err = j.w.Write(encoded)
-}
-
-// hashes writes a label to configuration to hash mapping. A nil map is
-// written as null, as encoding/json would, since TargetHashes has no
-// omitempty.
-func (j *jsonWriter) hashes(m map[string]map[string]string) {
-	if m == nil {
-		j.raw("null")
-		return
-	}
-	j.raw("{")
-	for i, label := range sortedKeys(m) {
-		if i > 0 {
-			j.raw(",")
-		}
-		j.key(label)
-		j.raw("{")
-		for k, configuration := range sortedKeys(m[label]) {
-			if k > 0 {
-				j.raw(",")
-			}
-			j.key(configuration)
-			j.str(m[label][configuration])
-		}
-		j.raw("}")
-	}
-	j.raw("}")
-}
-
-// edges writes a label to dependency labels mapping. Dependency lists are
-// already sorted by ExtractEdges and are left in that order.
-func (j *jsonWriter) edges(m map[string][]string) {
-	j.raw("{")
-	for i, label := range sortedKeys(m) {
-		if i > 0 {
-			j.raw(",")
-		}
-		j.key(label)
-		j.raw("[")
-		for k, dep := range m[label] {
-			if k > 0 {
-				j.raw(",")
-			}
-			j.str(dep)
-		}
-		j.raw("]")
-	}
-	j.raw("}")
-}
-
-func sortedKeys[V any](m map[string]V) []string {
-	keys := make([]string, 0, len(m))
-	for key := range m {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	return keys
-}
-
-func needsJSONEscape(s string) bool {
-	for i := 0; i < len(s); i++ {
-		if c := s[i]; c < 0x20 || c == '"' || c == '\\' {
-			return true
-		}
-	}
-	return false
 }
 
 // LoadPersistedHashes loads persisted hash data from a JSON file
