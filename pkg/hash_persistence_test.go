@@ -360,7 +360,20 @@ func TestPersistenceModesPreserveHashesAndGeneratedFileEdges(t *testing.T) {
 	if got := seedable.TargetEdges[outputLabel.String()]; len(got) != 1 || got[0] != generatorLabel.String() {
 		t.Fatalf("seedable generated-file edge = %v, want [%s]", got, generatorLabel)
 	}
-	if !reflect.DeepEqual(seedable.TargetHashes, legacy.TargetHashes) {
-		t.Fatalf("seedable hashes differ from legacy hashes:\nseedable: %v\nlegacy: %v", seedable.TargetHashes, legacy.TargetHashes)
+	// Seedable hashes are a superset of legacy hashes — they include
+	// dependency-only targets (e.g. generated files) that appear in the
+	// edge map but not in MatchingTargets.
+	for label, legacyConfigs := range legacy.TargetHashes {
+		seedableConfigs, ok := seedable.TargetHashes[label]
+		if !ok {
+			t.Fatalf("seedable hashes missing legacy label %s", label)
+		}
+		if !reflect.DeepEqual(seedableConfigs, legacyConfigs) {
+			t.Fatalf("seedable hashes for %s differ from legacy: seedable=%v legacy=%v", label, seedableConfigs, legacyConfigs)
+		}
+	}
+	// The generated file output should now have a hash in seedable mode.
+	if _, ok := seedable.TargetHashes[outputLabel.String()]; !ok {
+		t.Fatal("seedable hashes should include dependency-only target //gen:output")
 	}
 }

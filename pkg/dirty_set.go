@@ -2,7 +2,6 @@ package pkg
 
 import (
 	"encoding/hex"
-	"log"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -214,35 +213,9 @@ func findChangedTargets(
 	probeHashes map[string]string,
 ) map[string]bool {
 	changed := make(map[string]bool)
-	unchanged := make(map[string]bool)
 	for label := range dirtyLabels {
 		if targetHashChanged(label, seedHashes[label], probeHashes) {
 			changed[label] = true
-		} else {
-			unchanged[label] = true
-		}
-	}
-	if len(changed) > 0 || len(unchanged) > 0 {
-		log.Printf("Probe hash comparison: %d changed, %d unchanged out of %d dirty labels",
-			len(changed), len(unchanged), len(dirtyLabels))
-		for label := range changed {
-			reason := "hash_differs"
-			if seedHashes[label] == nil {
-				reason = "new_target"
-			} else {
-				for config, seedHex := range seedHashes[label] {
-					probeHex, ok := probeHashes[label+"\x00"+config]
-					if !ok {
-						reason = "missing_from_probe"
-						break
-					}
-					if probeHex != seedHex {
-						reason = "hash_differs"
-						break
-					}
-				}
-			}
-			log.Printf("  changed: %s (%s)", label, reason)
 		}
 	}
 	return changed

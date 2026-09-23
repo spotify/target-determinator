@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/bazel-contrib/target-determinator/third_party/protobuf/bazel/build"
@@ -183,6 +184,7 @@ func persistHashes(filePath string, gitCommitSha string, queryResults *QueryResu
 		if err != nil {
 			return fmt.Errorf("failed to extract target edges: %w", err)
 		}
+		AddDependencyHashes(targetHashes, targetEdges, queryResults.TargetHashCache)
 		compatibilityFingerprint, err := ComputeSeedCompatibilityFingerprint(context, targetsPattern, queryResults.BazelRelease)
 		if err != nil {
 			return err
@@ -193,6 +195,39 @@ func persistHashes(filePath string, gitCommitSha string, queryResults *QueryResu
 	}
 
 	return writePersistedData(filePath, &persistedData, !seedable)
+}
+
+// addDependencyHashes supplements targetHashes with hashes for labels that
+// appear in the edge map but are not matching targets (e.g. manual-tagged
+// deps, platform() rules, generated file outputs). These hashes are already
+// computed in the cache via recursive Hash() calls. Including them in the
+// seed lets the probe compare them and avoid false-positive rdeps
+// propagation.
+func AddDependencyHashes(targetHashes map[string]map[string]string, edges map[string][]string, cache *TargetHashCache) {
+	allCachedHashes := cache.ExtractHashes()
+
+	// Index cached hashes by label for efficient lookup.
+	cachedByLabel := make(map[string]map[string]string)
+	for key, hashBytes := range allCachedHashes {
+		idx := strings.IndexByte(key, '\x00')
+		if idx < 0 {
+			continue
+		}
+		label, config := key[:idx], key[idx+1:]
+		if cachedByLabel[label] == nil {
+			cachedByLabel[label] = make(map[string]string)
+		}
+		cachedByLabel[label][config] = hex.EncodeToString(hashBytes)
+	}
+
+	for label := range edges {
+		if _, ok := targetHashes[label]; ok {
+			continue
+		}
+		if configs, ok := cachedByLabel[label]; ok {
+			targetHashes[label] = configs
+		}
+	}
 }
 
 // WritePersistedData writes a PersistedHashData struct directly to a JSON file.

@@ -590,6 +590,7 @@ func mergePersistedData(
 		}
 	}
 	mergedEdges := mergePersistedEntries(seedData.TargetEdges, dirtyLabels, freshEdges)
+	pkg.AddDependencyHashes(persistedData.TargetHashes, mergedEdges, queryResults.TargetHashCache)
 	persistedData.FormatVersion = pkg.CurrentPersistedHashFormatVersion
 	persistedData.SeedCompatibilityFingerprint = compatibilityFingerprint
 	persistedData.TargetEdges = mergedEdges
