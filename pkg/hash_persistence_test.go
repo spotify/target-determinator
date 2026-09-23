@@ -415,3 +415,28 @@ func TestAddDependencyHashesCoversEdgeKeysAndDependencyValues(t *testing.T) {
 		t.Errorf("existing hash overwritten with %q", got)
 	}
 }
+
+func TestAddDependencyHashesSkipsEmptyHashSentinel(t *testing.T) {
+	// The cache returns a zero-length sentinel instead of a hash when a
+	// label's file is missing or is a directory. Persisting it would make
+	// the whole seed fail validation.
+	cache := NewTargetHashCache(nil, &Normalizer{}, "release 8.0.0", true, nil)
+	if err := cache.SeedHashes(map[string][]byte{
+		"//pkg:real\x00":    bytes.Repeat([]byte{0x44}, sha256.Size),
+		"//pkg:missing\x00": {},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	targetHashes := map[string]map[string]string{}
+	AddDependencyHashes(targetHashes, map[string][]string{
+		"//pkg:real": {"//pkg:missing"},
+	}, cache)
+
+	if _, ok := targetHashes["//pkg:real"]; !ok {
+		t.Error("//pkg:real should have been added")
+	}
+	if got, ok := targetHashes["//pkg:missing"]; ok {
+		t.Errorf("empty-hash sentinel should not be persisted, got %v", got)
+	}
+}

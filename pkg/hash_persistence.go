@@ -226,6 +226,15 @@ func AddDependencyHashes(targetHashes map[string]map[string]string, edges map[st
 		if !ok || !wanted[label] {
 			continue
 		}
+		// The cache yields a zero-length sentinel rather than a hash for
+		// labels whose file does not exist or is a directory. Persisting
+		// one would fail seed validation, which requires every hash to be
+		// sha256-sized, and cause the whole seed to be rejected. Omitting
+		// the label instead just makes incremental hashing treat it as
+		// changed, which is the safe direction.
+		if len(hashHex) != hex.EncodedLen(sha256.Size) {
+			continue
+		}
 		configs := targetHashes[label]
 		if configs == nil {
 			configs = make(map[string]string)
