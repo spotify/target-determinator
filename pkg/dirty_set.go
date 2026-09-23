@@ -283,6 +283,19 @@ func ProbeHashesFromQueryResults(queryResults *QueryResults) (map[string]string,
 	return hashes, nil
 }
 
+// ProbeHashesFromCache extracts hex-encoded hashes for ALL targets in the
+// hash cache, not just matching targets. This includes dependency-only
+// targets (manual-tagged, platform rules, generated files) whose hashes
+// were computed transitively during PrefillCache.
+func ProbeHashesFromCache(queryResults *QueryResults) (map[string]string, error) {
+	allCachedHashes := queryResults.TargetHashCache.ExtractHashes()
+	hashes := make(map[string]string, len(allCachedHashes))
+	for key, hashBytes := range allCachedHashes {
+		hashes[key] = hex.EncodeToString(hashBytes)
+	}
+	return hashes, nil
+}
+
 func isFallbackTrigger(basename string) bool {
 	if strings.HasSuffix(basename, ".bzl") {
 		return true

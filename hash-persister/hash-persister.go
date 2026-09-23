@@ -463,7 +463,11 @@ func probePackageHashes(
 		return nil, fmt.Errorf("probe hashing failed: %w", err)
 	}
 
-	return pkg.ProbeHashesFromQueryResults(probeResults)
+	// Extract hashes for matching targets plus all transitively-computed
+	// dependency hashes (manual-tagged, platform, generated file targets).
+	// ProbeHashesFromQueryResults only returns matching targets; the cache
+	// also has hashes for their deps computed during PrefillCache.
+	return pkg.ProbeHashesFromCache(probeResults)
 }
 
 // buildExternalSeedHashes collects seed hashes for all targets NOT in the
