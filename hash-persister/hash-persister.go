@@ -466,11 +466,10 @@ func probePackageHashes(
 		return nil, fmt.Errorf("probe hashing failed: %w", err)
 	}
 
-	// Extract hashes for matching targets plus all transitively-computed
-	// dependency hashes (manual-tagged, platform, generated file targets).
-	// ProbeHashesFromQueryResults only returns matching targets; the cache
-	// also has hashes for their deps computed during PrefillCache.
-	return pkg.ProbeHashesFromCache(probeResults)
+	// Read straight from the cache rather than from MatchingTargets: it
+	// additionally holds the transitively-computed hashes of dependencies
+	// outside the probed packages, which cost nothing extra to include.
+	return probeResults.TargetHashCache.ExtractHexHashes(), nil
 }
 
 // buildProbePattern returns a bazel query expression covering every target

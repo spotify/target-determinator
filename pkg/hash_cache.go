@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -200,6 +201,26 @@ func (thc *TargetHashCache) ExtractHashes() map[string][]byte {
 		}
 	}
 	return result
+}
+
+// ExtractHexHashes is ExtractHashes with the hashes hex-encoded, matching
+// the representation used in persisted hash files.
+func (thc *TargetHashCache) ExtractHexHashes() map[string]string {
+	raw := thc.ExtractHashes()
+	hashes := make(map[string]string, len(raw))
+	for key, hash := range raw {
+		hashes[key] = hex.EncodeToString(hash)
+	}
+	return hashes
+}
+
+// splitHashKey splits a "<label>\x00<configuration>" cache key.
+func splitHashKey(key string) (label, configuration string, ok bool) {
+	idx := strings.IndexByte(key, '\x00')
+	if idx < 0 {
+		return "", "", false
+	}
+	return key[:idx], key[idx+1:], true
 }
 
 // RestoreHashes populates the cache with pre-computed hashes and freezes the cache.

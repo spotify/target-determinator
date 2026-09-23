@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"os"
 	"sort"
-	"strings"
 	"time"
 
 	"github.com/bazel-contrib/target-determinator/third_party/protobuf/bazel/build"
@@ -197,45 +196,42 @@ func persistHashes(filePath string, gitCommitSha string, queryResults *QueryResu
 	return writePersistedData(filePath, &persistedData, !seedable)
 }
 
-// addDependencyHashes supplements targetHashes with hashes for labels that
-// appear in the edge map but are not matching targets (e.g. manual-tagged
-// deps, platform() rules, generated file outputs). These hashes are already
-// computed in the cache via recursive Hash() calls. Including them in the
-// seed lets the probe compare them and avoid false-positive rdeps
-// propagation.
+// AddDependencyHashes supplements targetHashes with hashes for labels that
+// appear in the edge map but are not matching targets — manual-tagged deps,
+// platform() rules, generated file outputs. Their hashes were already
+// computed in the cache via recursive Hash() calls, so persisting them is
+// free, and without them incremental hashing cannot tell whether such a
+// label changed and must conservatively propagate its reverse dependencies.
 func AddDependencyHashes(targetHashes map[string]map[string]string, edges map[string][]string, cache *TargetHashCache) {
-	allCachedHashes := cache.ExtractHashes()
+	// Both edge keys and dependency values: leaf labels (source files, npm
+	// /ref targets) never appear as keys, so iterating keys alone misses them.
+	wanted := make(map[string]bool)
+	consider := func(label string) {
+		if _, ok := targetHashes[label]; !ok {
+			wanted[label] = true
+		}
+	}
+	for label, deps := range edges {
+		consider(label)
+		for _, dep := range deps {
+			consider(dep)
+		}
+	}
+	if len(wanted) == 0 {
+		return
+	}
 
-	// Index cached hashes by label for efficient lookup.
-	cachedByLabel := make(map[string]map[string]string)
-	for key, hashBytes := range allCachedHashes {
-		idx := strings.IndexByte(key, '\x00')
-		if idx < 0 {
+	for key, hashHex := range cache.ExtractHexHashes() {
+		label, configuration, ok := splitHashKey(key)
+		if !ok || !wanted[label] {
 			continue
 		}
-		label, config := key[:idx], key[idx+1:]
-		if cachedByLabel[label] == nil {
-			cachedByLabel[label] = make(map[string]string)
-		}
-		cachedByLabel[label][config] = hex.EncodeToString(hashBytes)
-	}
-
-	add := func(label string) {
-		if _, ok := targetHashes[label]; ok {
-			return
-		}
-		if configs, ok := cachedByLabel[label]; ok {
+		configs := targetHashes[label]
+		if configs == nil {
+			configs = make(map[string]string)
 			targetHashes[label] = configs
 		}
-	}
-	// Cover both edge keys and dependency values. Leaf labels (source files,
-	// npm /ref targets) never appear as keys, so iterating keys alone would
-	// miss them and leave the probe unable to compare their hashes.
-	for label, deps := range edges {
-		add(label)
-		for _, dep := range deps {
-			add(dep)
-		}
+		configs[configuration] = hashHex
 	}
 }
 

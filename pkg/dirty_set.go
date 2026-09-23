@@ -1,7 +1,6 @@
 package pkg
 
 import (
-	"encoding/hex"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -171,23 +170,17 @@ func ComputeDirtySet(
 	return result
 }
 
-// PruneDirtySet narrows a DirtySetResult by re-propagating reverse
-// dependencies only from targets whose hashes actually changed. The caller
-// must supply probeHashes — a map from "label\x00configuration" to the hex
-// hash computed at the destination revision — for every target in the
-// directly dirty packages. Targets whose probe hash matches the seed are
-// excluded from rdeps propagation, dramatically reducing the dirty set when
-// a BUILD.bazel change doesn't affect most existing targets (e.g. adding a
-// new target to a high-fanout package).
+// PruneDirtySet narrows a DirtySetResult by propagating reverse
+// dependencies only from targets whose hash actually changed, rather than
+// from every target in a dirty package. A BUILD.bazel edit marks its whole
+// package dirty, so in a high-fanout package the unpruned rdeps closure can
+// cover most of the repository even when only one target really changed.
 //
-// seedHashes is the TargetHashes map from the seed file (label → config → hex hash).
-// edges is the TargetEdges map from the seed file.
-// original is the DirtySetResult from ComputeDirtySet.
-// probeHashes maps "label\x00config" → hex hash for targets in dirty packages.
-//
-// PruneDirtySet preserves the original DirtyLabels and DirtyPackages
-// (packages still need re-listing via wildcards) but recomputes
-// DirtyStarLabels from scratch.
+// probeHashes must cover every label in the dirty packages, keyed as
+// "label\x00configuration"; labels it omits are conservatively treated as
+// changed. DirtyLabels and DirtyPackages are preserved — those packages
+// still need re-listing via wildcards — and only DirtyStarLabels is
+// recomputed.
 func PruneDirtySet(
 	original *DirtySetResult,
 	seedHashes map[string]map[string]string,
@@ -241,7 +234,7 @@ func targetHashChanged(label string, seedConfigs map[string]string, probeHashes 
 // labels and BFS-propagating rdeps only from the actuallyChanged subset.
 func propagateFrom(dirtyLabels, actuallyChanged map[string]bool, edges map[string][]string) map[string]bool {
 	rdeps := BuildRdeps(edges)
-	result := make(map[string]bool, len(actuallyChanged))
+	result := make(map[string]bool, len(dirtyLabels))
 
 	for label := range dirtyLabels {
 		result[label] = true
@@ -262,38 +255,6 @@ func propagateFrom(dirtyLabels, actuallyChanged map[string]bool, edges map[strin
 		}
 	}
 	return result
-}
-
-// ProbeHashesFromQueryResults extracts hex-encoded hashes for all matching
-// targets in a QueryResults, keyed as "label\x00configuration". This is
-// used by the probe phase to compare against seed hashes.
-func ProbeHashesFromQueryResults(queryResults *QueryResults) (map[string]string, error) {
-	hashes := make(map[string]string)
-	for _, label := range queryResults.MatchingTargets.Labels() {
-		for _, cfg := range queryResults.MatchingTargets.ConfigurationsFor(label) {
-			hash, err := queryResults.TargetHashCache.Hash(LabelAndConfiguration{
-				Label: label, Configuration: cfg,
-			})
-			if err != nil {
-				return nil, err
-			}
-			hashes[label.String()+"\x00"+cfg.String()] = hex.EncodeToString(hash)
-		}
-	}
-	return hashes, nil
-}
-
-// ProbeHashesFromCache extracts hex-encoded hashes for ALL targets in the
-// hash cache, not just matching targets. This includes dependency-only
-// targets (manual-tagged, platform rules, generated files) whose hashes
-// were computed transitively during PrefillCache.
-func ProbeHashesFromCache(queryResults *QueryResults) (map[string]string, error) {
-	allCachedHashes := queryResults.TargetHashCache.ExtractHashes()
-	hashes := make(map[string]string, len(allCachedHashes))
-	for key, hashBytes := range allCachedHashes {
-		hashes[key] = hex.EncodeToString(hashBytes)
-	}
-	return hashes, nil
 }
 
 func isFallbackTrigger(basename string) bool {

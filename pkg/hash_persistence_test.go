@@ -1,6 +1,9 @@
 package pkg
 
 import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -375,5 +378,40 @@ func TestPersistenceModesPreserveHashesAndGeneratedFileEdges(t *testing.T) {
 	// The generated file output should now have a hash in seedable mode.
 	if _, ok := seedable.TargetHashes[outputLabel.String()]; !ok {
 		t.Fatal("seedable hashes should include dependency-only target //gen:output")
+	}
+}
+
+func TestAddDependencyHashesCoversEdgeKeysAndDependencyValues(t *testing.T) {
+	filled := func(b byte) []byte { return bytes.Repeat([]byte{b}, sha256.Size) }
+
+	cache := NewTargetHashCache(nil, &Normalizer{}, "release 8.0.0", true, nil)
+	if err := cache.SeedHashes(map[string][]byte{
+		"//pkg:rule\x00":     filled(0x11),
+		"//pkg:leaf.txt\x00": filled(0x22),
+		"//pkg:already\x00":  filled(0x33),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// leaf.txt appears only as a dependency value, never as a key — the
+	// shape that leaves a label unhashable by the probe if missed.
+	edges := map[string][]string{
+		"//pkg:rule":    {"//pkg:leaf.txt"},
+		"//pkg:already": {},
+	}
+	targetHashes := map[string]map[string]string{
+		"//pkg:already": {"": "preexisting"},
+	}
+
+	AddDependencyHashes(targetHashes, edges, cache)
+
+	if got := targetHashes["//pkg:rule"][""]; got != hex.EncodeToString(filled(0x11)) {
+		t.Errorf("edge key //pkg:rule not added, got %q", got)
+	}
+	if got := targetHashes["//pkg:leaf.txt"][""]; got != hex.EncodeToString(filled(0x22)) {
+		t.Errorf("dependency-value-only //pkg:leaf.txt not added, got %q", got)
+	}
+	if got := targetHashes["//pkg:already"][""]; got != "preexisting" {
+		t.Errorf("existing hash overwritten with %q", got)
 	}
 }
