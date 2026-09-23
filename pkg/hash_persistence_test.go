@@ -447,3 +447,102 @@ func TestAddDependencyHashesSkipsEmptyHashSentinel(t *testing.T) {
 		t.Errorf("empty-hash sentinel should not be persisted, got %v", got)
 	}
 }
+
+// A realistic payload must stream byte-for-byte what encoding/json would
+// produce, which pins field order, omitempty behaviour and key sorting.
+func TestStreamedSeedableOutputMatchesStdlibBytes(t *testing.T) {
+	data := &PersistedHashData{
+		FormatVersion:                CurrentPersistedHashFormatVersion,
+		SeedCompatibilityFingerprint: "fingerprint",
+		GitCommitSha:                 "abc123",
+		Timestamp:                    time.Unix(1700000000, 0).UTC(),
+		BazelRelease:                 "release 9.2.0",
+		TargetHashes: map[string]map[string]string{
+			"//z:last":  {"": "bb"},
+			"//a:first": {"": "aa", "cfg": "cc"},
+		},
+		TargetEdges: map[string][]string{
+			"//a:first": {"//z:last", "@@repo+ext//p:q"},
+		},
+		DependencyHashes: map[string]map[string]string{
+			"//tools/binaries:platform": {"": "dd"},
+		},
+		Metadata: HashMetadata{TargetsPattern: "//...", TotalTargets: 3},
+	}
+
+	path := filepath.Join(t.TempDir(), "seedable.json")
+	if err := writePersistedData(path, data, false); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	want, err := json.Marshal(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want = append(want, '\n')
+
+	if !bytes.Equal(got, want) {
+		t.Fatalf("streamed output differs from encoding/json:\n got: %s\nwant: %s", got, want)
+	}
+}
+
+func TestStreamedOutputRoundTripsAwkwardStrings(t *testing.T) {
+	// The fast path copies strings verbatim, so anything needing escaping
+	// has to fall through to the stdlib correctly.
+	awkward := "//pkg:a\"quote\\backslash\u0001ctrl\tünïcode"
+	data := &PersistedHashData{
+		FormatVersion: CurrentPersistedHashFormatVersion,
+		GitCommitSha:  "abc123",
+		Timestamp:     time.Unix(1700000000, 0).UTC(),
+		BazelRelease:  "release 9.2.0",
+		TargetHashes:  map[string]map[string]string{awkward: {awkward: awkward}},
+		TargetEdges:   map[string][]string{awkward: {awkward}},
+		Metadata:      HashMetadata{TargetsPattern: awkward, TotalTargets: 1},
+	}
+
+	path := filepath.Join(t.TempDir(), "awkward.json")
+	if err := writePersistedData(path, data, false); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := LoadPersistedHashes(path)
+	if err != nil {
+		t.Fatalf("streamed output is not parseable: %v", err)
+	}
+	if !reflect.DeepEqual(loaded.TargetHashes, data.TargetHashes) {
+		t.Errorf("target hashes did not round-trip: %v", loaded.TargetHashes)
+	}
+	if !reflect.DeepEqual(loaded.TargetEdges, data.TargetEdges) {
+		t.Errorf("target edges did not round-trip: %v", loaded.TargetEdges)
+	}
+}
+
+func TestStreamedOutputOmitsEmptyFieldsLikeStdlib(t *testing.T) {
+	// A v8-shaped artifact must not gain incremental keys.
+	data := &PersistedHashData{
+		GitCommitSha: "abc123",
+		Timestamp:    time.Unix(1700000000, 0).UTC(),
+		BazelRelease: "release 9.2.0",
+		TargetHashes: map[string]map[string]string{"//a:b": {"": "aa"}},
+		Metadata:     HashMetadata{TargetsPattern: "//...", TotalTargets: 1},
+	}
+	path := filepath.Join(t.TempDir(), "v8.json")
+	if err := writePersistedData(path, data, false); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{
+		"format_version", "seed_compatibility_fingerprint",
+		"target_edges", "dependency_hashes",
+	} {
+		if strings.Contains(string(got), key) {
+			t.Errorf("empty field %q should have been omitted: %s", key, got)
+		}
+	}
+}
