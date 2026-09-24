@@ -724,3 +724,80 @@ func TestPruneDirtySetReadsDependencyHashes(t *testing.T) {
 		t.Error("//app:consumer should be pruned: //pkg:tool is unchanged per DependencyHashes")
 	}
 }
+
+func TestIsFallbackTriggerLockfiles(t *testing.T) {
+	tests := []struct {
+		basename string
+		want     bool
+	}{
+		// Plain ".lock" extension.
+		{"Cargo.lock", true},
+		{"yarn.lock", true},
+		{"poetry.lock", true},
+		{"uv.lock", true},
+		{"buf.lock", true},
+		{"MODULE.bazel.lock", true},
+
+		// ".lock" as an inner component.
+		{"multitool.lock.json", true},
+		{".terraform.lock.hcl", true},
+
+		// "-lock" or "_lock" name stem.
+		{"pnpm-lock.yaml", true},
+		{"package-lock.json", true},
+
+		// An unrecognised extension stays conservative and still triggers.
+		{"deps-lock.xyz", true},
+
+		// Ordinary files merely named after a lock must not trigger.
+		{"merge-pnpm-lock.sh", false},
+		{"regen-pnpm-lock.sh", false},
+		{"repin-with-lock.sh", false},
+		{"2x-lock.png", false},
+		{"db.carbon.leader-lock.xml", false},
+		{"02_add_and_lock.md", false},
+		{"v3__workflow_lock.sql", false},
+
+		// Nothing lock-like at all.
+		{"README.md", false},
+		{"Main.java", false},
+	}
+
+	for _, tt := range tests {
+		if got := isFallbackTrigger(tt.basename); got != tt.want {
+			t.Errorf("isFallbackTrigger(%q) = %v, want %v", tt.basename, got, tt.want)
+		}
+	}
+}
+
+func TestComputeDirtySetNestedLockExtensionFallsBack(t *testing.T) {
+	changedFiles := map[string]string{
+		"tools/multitool.lock.json": "M",
+	}
+
+	result := ComputeDirtySet(changedFiles, nil, nil, nil)
+
+	if !result.NeedsFallback {
+		t.Fatal("expected fallback for multitool.lock.json change")
+	}
+	if result.FallbackCode != "unsafe_file_change" {
+		t.Errorf("FallbackCode = %q, want unsafe_file_change", result.FallbackCode)
+	}
+}
+
+func TestComputeDirtySetLockNamedScriptDoesNotFallBack(t *testing.T) {
+	edges := map[string][]string{
+		"//pkg:rule_a": {},
+	}
+	allLabels := CollectAllLabels(edges, nil)
+
+	changedFiles := map[string]string{
+		"tools/git/merge-pnpm-lock.sh": "M",
+	}
+
+	result := ComputeDirtySet(changedFiles, edges, allLabels, nil)
+
+	if result.NeedsFallback {
+		t.Errorf("unexpected fallback for a shell script: %s", result.FallbackReason)
+	}
+}
