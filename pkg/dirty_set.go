@@ -170,6 +170,137 @@ func ComputeDirtySet(
 	return result
 }
 
+// ProbeResult is what a probe of the dirty packages learned about them.
+type ProbeResult struct {
+	// Hashes maps "label\x00configuration" to the hex hash computed at the
+	// destination revision.
+	Hashes map[string]string
+	// SourceFiles is the set of probed labels that are source files. Their
+	// dirtiness comes from the git diff rather than from Hashes.
+	SourceFiles map[string]bool
+}
+
+// PruneDirtySet narrows a DirtySetResult by propagating reverse
+// dependencies only from targets that actually changed, rather than from
+// every target in a dirty package. A BUILD.bazel edit marks its whole
+// package dirty, so in a high-fanout package the unpruned rdeps closure can
+// cover most of the repository even when only one target really changed.
+//
+// A source file is unchanged exactly when the git diff does not mention it.
+// Every other label is unchanged when its probe hash matches the seed;
+// labels the probe or the seed omits are conservatively treated as changed.
+//
+// DirtyLabels and DirtyPackages are preserved — those packages still need
+// re-listing via wildcards — and only DirtyStarLabels is recomputed.
+func PruneDirtySet(
+	original *DirtySetResult,
+	seed *PersistedHashData,
+	probe ProbeResult,
+	changedFiles map[string]string,
+) *DirtySetResult {
+	actuallyChanged := findChangedTargets(original.DirtyLabels, seed, probe, changedFiles)
+	newDirtyStar := propagateFrom(original.DirtyLabels, actuallyChanged, seed.TargetEdges)
+
+	return &DirtySetResult{
+		DirtyLabels:     original.DirtyLabels,
+		DirtyStarLabels: newDirtyStar,
+		DirtyPackages:   original.DirtyPackages,
+	}
+}
+
+// findChangedTargets returns the subset of dirtyLabels that changed between
+// the seed and the destination revision.
+func findChangedTargets(
+	dirtyLabels map[string]bool,
+	seed *PersistedHashData,
+	probe ProbeResult,
+	changedFiles map[string]string,
+) map[string]bool {
+	changed := make(map[string]bool)
+	for label := range dirtyLabels {
+		if probe.SourceFiles[label] {
+			if _, ok := changedFiles[labelToPath(label)]; ok {
+				changed[label] = true
+			}
+			continue
+		}
+		if targetHashChanged(label, seed.SeedHashes(label), probe.Hashes) {
+			changed[label] = true
+		}
+	}
+	return changed
+}
+
+// labelToPath returns the workspace-relative path a main-repo label refers
+// to, e.g. "//pkg:sub/f.java" becomes "pkg/sub/f.java".
+func labelToPath(label string) string {
+	if idx := strings.Index(label, "//"); idx >= 0 {
+		label = label[idx+len("//"):]
+	}
+	pkg, name, found := strings.Cut(label, ":")
+	switch {
+	case !found:
+		return pkg
+	case pkg == "":
+		return name
+	default:
+		return pkg + "/" + name
+	}
+}
+
+// targetHashChanged reports whether a single target's probe hash differs
+// from its seed hash. Returns true for new targets (nil seedConfigs) and
+// targets missing from probe results.
+func targetHashChanged(label string, seedConfigs map[string]string, probeHashes map[string]string) bool {
+	if seedConfigs == nil {
+		return true
+	}
+	for config, seedHex := range seedConfigs {
+		probeHex, ok := probeHashes[label+"\x00"+config]
+		if !ok || probeHex != seedHex {
+			return true
+		}
+	}
+	return false
+}
+
+// propagateFrom builds DirtyStarLabels by including all directly dirty
+// labels and BFS-propagating rdeps only from the actuallyChanged subset.
+func propagateFrom(dirtyLabels, actuallyChanged map[string]bool, edges map[string][]string) map[string]bool {
+	rdeps := BuildRdeps(edges)
+
+	// Every directly dirty label is dirty* regardless of whether it
+	// changed, but membership of the result must not be mistaken for
+	// having been traversed: an unchanged dirty label still has to be
+	// walked through to reach what lies behind it. Hence a separate
+	// visited set from the result set.
+	result := make(map[string]bool, len(dirtyLabels))
+	for label := range dirtyLabels {
+		result[label] = true
+	}
+
+	visited := make(map[string]bool, len(actuallyChanged))
+	queue := make([]string, 0, len(actuallyChanged))
+	for label := range actuallyChanged {
+		if !visited[label] {
+			visited[label] = true
+			queue = append(queue, label)
+		}
+	}
+	for len(queue) > 0 {
+		current := queue[0]
+		queue = queue[1:]
+		for _, rdep := range rdeps[current] {
+			result[rdep] = true
+			if !visited[rdep] {
+				visited[rdep] = true
+				queue = append(queue, rdep)
+			}
+		}
+	}
+	return result
+}
+
 func isFallbackTrigger(basename string) bool {
 	if strings.HasSuffix(basename, ".bzl") {
 		return true

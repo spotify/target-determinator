@@ -462,3 +462,265 @@ func TestLabelToPackage(t *testing.T) {
 		}
 	}
 }
+
+func TestPruneDirtySetEliminatesUnchangedRdeps(t *testing.T) {
+	// Setup: package //tools/binaries has two aliases. //app:binary depends
+	// on //tools/binaries:existing_tool. A BUILD.bazel change makes both
+	// aliases directly dirty, propagating to //app:binary.
+	edges := map[string][]string{
+		"//tools/binaries:existing_tool": {},
+		"//tools/binaries:new_tool":      {},
+		"//app:binary":                   {"//tools/binaries:existing_tool"},
+		"//other:lib":                    {"//app:binary"},
+	}
+	allLabels := CollectAllLabels(edges, nil)
+
+	changedFiles := map[string]string{
+		"tools/binaries/BUILD.bazel": "M",
+	}
+
+	original := ComputeDirtySet(changedFiles, edges, allLabels, nil)
+
+	// Verify the unpruned dirty set cascades broadly.
+	if !original.DirtyStarLabels["//app:binary"] {
+		t.Fatal("expected //app:binary in unpruned DirtyStarLabels")
+	}
+	if !original.DirtyStarLabels["//other:lib"] {
+		t.Fatal("expected //other:lib in unpruned DirtyStarLabels")
+	}
+
+	// Seed hashes: existing_tool has hash "aaaa...", new_tool is absent (new target).
+	seedHashes := map[string]map[string]string{
+		"//tools/binaries:existing_tool": {"": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+		"//app:binary":                   {"": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
+		"//other:lib":                    {"": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"},
+	}
+
+	// Probe hashes: existing_tool is UNCHANGED, new_tool is new.
+	probeHashes := map[string]string{
+		"//tools/binaries:existing_tool\x00": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		"//tools/binaries:new_tool\x00":      "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+	}
+
+	pruned := PruneDirtySet(original, &PersistedHashData{TargetHashes: seedHashes, TargetEdges: edges}, ProbeResult{Hashes: probeHashes}, nil)
+
+	// Directly dirty labels should be preserved.
+	if !pruned.DirtyStarLabels["//tools/binaries:existing_tool"] {
+		t.Error("expected //tools/binaries:existing_tool in pruned DirtyStarLabels (still directly dirty)")
+	}
+	if !pruned.DirtyStarLabels["//tools/binaries:new_tool"] {
+		t.Error("expected //tools/binaries:new_tool in pruned DirtyStarLabels (new target, actually changed)")
+	}
+
+	// The key assertion: //app:binary and //other:lib should NOT be in the
+	// pruned dirty set because existing_tool's hash didn't change.
+	// new_tool has no rdeps, so its change doesn't propagate.
+	if pruned.DirtyStarLabels["//app:binary"] {
+		t.Error("//app:binary should have been pruned — its dep //tools/binaries:existing_tool is unchanged")
+	}
+	if pruned.DirtyStarLabels["//other:lib"] {
+		t.Error("//other:lib should have been pruned — transitive dep unchanged")
+	}
+
+	// DirtyPackages should be preserved.
+	if len(pruned.DirtyPackages) != 1 || pruned.DirtyPackages[0] != "//tools/binaries" {
+		t.Errorf("expected DirtyPackages=[//tools/binaries], got %v", pruned.DirtyPackages)
+	}
+}
+
+func TestPruneDirtySetPreservesChangedRdeps(t *testing.T) {
+	// When a target's hash actually changes, its rdeps must remain dirty.
+	edges := map[string][]string{
+		"//lib:changed":  {"//lib:src.java"},
+		"//lib:same":     {},
+		"//app:consumer": {"//lib:changed"},
+	}
+	allLabels := CollectAllLabels(edges, nil)
+
+	original := ComputeDirtySet(
+		map[string]string{"lib/BUILD.bazel": "M"}, edges, allLabels, nil,
+	)
+
+	seedHashes := map[string]map[string]string{
+		"//lib:changed":  {"": "aaaa0000aaaa0000aaaa0000aaaa0000aaaa0000aaaa0000aaaa0000aaaa0000"},
+		"//lib:same":     {"": "bbbb0000bbbb0000bbbb0000bbbb0000bbbb0000bbbb0000bbbb0000bbbb0000"},
+		"//lib:src.java": {"": "cccc0000cccc0000cccc0000cccc0000cccc0000cccc0000cccc0000cccc0000"},
+		"//app:consumer": {"": "dddd0000dddd0000dddd0000dddd0000dddd0000dddd0000dddd0000dddd0000"},
+	}
+
+	// Probe: //lib:changed has a DIFFERENT hash, //lib:same is unchanged.
+	probeHashes := map[string]string{
+		"//lib:changed\x00":  "ffff0000ffff0000ffff0000ffff0000ffff0000ffff0000ffff0000ffff0000",
+		"//lib:same\x00":     "bbbb0000bbbb0000bbbb0000bbbb0000bbbb0000bbbb0000bbbb0000bbbb0000",
+		"//lib:src.java\x00": "cccc0000cccc0000cccc0000cccc0000cccc0000cccc0000cccc0000cccc0000",
+	}
+
+	pruned := PruneDirtySet(original, &PersistedHashData{TargetHashes: seedHashes, TargetEdges: edges}, ProbeResult{Hashes: probeHashes}, nil)
+
+	if !pruned.DirtyStarLabels["//app:consumer"] {
+		t.Error("//app:consumer must remain dirty — its dep //lib:changed has a different hash")
+	}
+}
+
+func TestPruneDirtySetNoOpWhenAllChanged(t *testing.T) {
+	edges := map[string][]string{
+		"//pkg:a":   {},
+		"//app:dep": {"//pkg:a"},
+	}
+	allLabels := CollectAllLabels(edges, nil)
+
+	original := ComputeDirtySet(
+		map[string]string{"pkg/BUILD.bazel": "M"}, edges, allLabels, nil,
+	)
+
+	seedHashes := map[string]map[string]string{
+		"//pkg:a":   {"": "aaaa0000aaaa0000aaaa0000aaaa0000aaaa0000aaaa0000aaaa0000aaaa0000"},
+		"//app:dep": {"": "bbbb0000bbbb0000bbbb0000bbbb0000bbbb0000bbbb0000bbbb0000bbbb0000"},
+	}
+
+	// Probe: //pkg:a hash changed.
+	probeHashes := map[string]string{
+		"//pkg:a\x00": "ffff0000ffff0000ffff0000ffff0000ffff0000ffff0000ffff0000ffff0000",
+	}
+
+	pruned := PruneDirtySet(original, &PersistedHashData{TargetHashes: seedHashes, TargetEdges: edges}, ProbeResult{Hashes: probeHashes}, nil)
+
+	// Everything should remain dirty — same as unpruned.
+	if !pruned.DirtyStarLabels["//app:dep"] {
+		t.Error("//app:dep must remain dirty when //pkg:a changed")
+	}
+}
+
+func TestPruneDirtySetJudgesSourceFilesByGitNotHash(t *testing.T) {
+	// A source file carries no seed hash; the git diff decides. //pkg:kept.java
+	// is untouched so its consumer must not propagate, while //pkg:edited.java
+	// is in the diff so its consumer must.
+	edges := map[string][]string{
+		"//pkg:uses_kept":   {"//pkg:kept.java"},
+		"//pkg:uses_edited": {"//pkg:edited.java"},
+		"//app:via_kept":    {"//pkg:uses_kept"},
+		"//app:via_edited":  {"//pkg:uses_edited"},
+	}
+	allLabels := CollectAllLabels(edges, nil)
+	original := ComputeDirtySet(
+		map[string]string{"pkg/edited.java": "M"}, edges, allLabels, nil,
+	)
+
+	// Both source files are directly dirty before pruning, and both
+	// consumers are reachable from them.
+	for _, label := range []string{"//app:via_kept", "//app:via_edited"} {
+		if !original.DirtyStarLabels[label] {
+			t.Fatalf("expected %s in unpruned DirtyStarLabels", label)
+		}
+	}
+
+	// A consumer of a changed source file hashes differently, as it would
+	// in reality; the consumer of the untouched one does not.
+	unchanged := "aaaa0000aaaa0000aaaa0000aaaa0000aaaa0000aaaa0000aaaa0000aaaa0000"
+	differs := "ffff0000ffff0000ffff0000ffff0000ffff0000ffff0000ffff0000ffff0000"
+	seedHashes := map[string]map[string]string{
+		"//pkg:uses_kept":   {"": unchanged},
+		"//pkg:uses_edited": {"": unchanged},
+	}
+	probe := ProbeResult{
+		Hashes: map[string]string{
+			"//pkg:uses_kept\x00":   unchanged,
+			"//pkg:uses_edited\x00": differs,
+		},
+		SourceFiles: map[string]bool{
+			"//pkg:kept.java":   true,
+			"//pkg:edited.java": true,
+		},
+	}
+
+	pruned := PruneDirtySet(original,
+		&PersistedHashData{TargetHashes: seedHashes, TargetEdges: edges},
+		probe, map[string]string{"pkg/edited.java": "M"})
+
+	if pruned.DirtyStarLabels["//app:via_kept"] {
+		t.Error("//app:via_kept should be pruned: pkg/kept.java is not in the git diff")
+	}
+	if !pruned.DirtyStarLabels["//app:via_edited"] {
+		t.Error("//app:via_edited must stay dirty: pkg/edited.java is in the git diff")
+	}
+}
+
+func TestLabelToPath(t *testing.T) {
+	for _, tt := range []struct{ label, want string }{
+		{"//pkg:file.java", "pkg/file.java"},
+		{"//pkg:src/main/java/App.java", "pkg/src/main/java/App.java"},
+		{"//:root.txt", "root.txt"},
+		{"//a/b/c:d.txt", "a/b/c/d.txt"},
+		{"//pkg", "pkg"},
+	} {
+		if got := labelToPath(tt.label); got != tt.want {
+			t.Errorf("labelToPath(%q) = %q, want %q", tt.label, got, tt.want)
+		}
+	}
+}
+
+func TestPropagateTraversesThroughUnchangedDirtyLabels(t *testing.T) {
+	// //pkg:middle is dirty (its package changed) but its own hash did not
+	// change. It still has to be walked through, or //app:behind is lost.
+	// Membership of the result set must not double as "already traversed".
+	edges := map[string][]string{
+		"//pkg:changed": {"//pkg:src.java"},
+		"//pkg:middle":  {"//pkg:changed"},
+		"//app:behind":  {"//pkg:middle"},
+	}
+	allLabels := CollectAllLabels(edges, nil)
+	original := ComputeDirtySet(
+		map[string]string{"pkg/src.java": "M"}, edges, allLabels, nil,
+	)
+
+	unchanged := "bbbb0000bbbb0000bbbb0000bbbb0000bbbb0000bbbb0000bbbb0000bbbb0000"
+	seedHashes := map[string]map[string]string{
+		"//pkg:changed": {"": "cccc0000cccc0000cccc0000cccc0000cccc0000cccc0000cccc0000cccc0000"},
+		"//pkg:middle":  {"": unchanged},
+	}
+	probe := ProbeResult{
+		Hashes: map[string]string{
+			"//pkg:changed\x00": "dddd0000dddd0000dddd0000dddd0000dddd0000dddd0000dddd0000dddd0000",
+			"//pkg:middle\x00":  unchanged,
+		},
+		SourceFiles: map[string]bool{"//pkg:src.java": true},
+	}
+
+	pruned := PruneDirtySet(original,
+		&PersistedHashData{TargetHashes: seedHashes, TargetEdges: edges},
+		probe, map[string]string{"pkg/src.java": "M"})
+
+	if !pruned.DirtyStarLabels["//app:behind"] {
+		t.Error("//app:behind must be reached by traversing through the unchanged dirty label //pkg:middle")
+	}
+}
+
+func TestPruneDirtySetReadsDependencyHashes(t *testing.T) {
+	// A manual-tagged dep lives in DependencyHashes, not TargetHashes, yet
+	// must still be comparable or its reverse dependencies all propagate.
+	edges := map[string][]string{
+		"//pkg:tool":     {},
+		"//app:consumer": {"//pkg:tool"},
+	}
+	allLabels := CollectAllLabels(edges, nil)
+	original := ComputeDirtySet(
+		map[string]string{"pkg/BUILD.bazel": "M"}, edges, allLabels, nil,
+	)
+	if !original.DirtyStarLabels["//app:consumer"] {
+		t.Fatal("expected //app:consumer in unpruned DirtyStarLabels")
+	}
+
+	unchanged := "aaaa0000aaaa0000aaaa0000aaaa0000aaaa0000aaaa0000aaaa0000aaaa0000"
+	seed := &PersistedHashData{
+		TargetHashes:     map[string]map[string]string{},
+		DependencyHashes: map[string]map[string]string{"//pkg:tool": {"": unchanged}},
+		TargetEdges:      edges,
+	}
+	probe := ProbeResult{Hashes: map[string]string{"//pkg:tool\x00": unchanged}}
+
+	pruned := PruneDirtySet(original, seed, probe, nil)
+
+	if pruned.DirtyStarLabels["//app:consumer"] {
+		t.Error("//app:consumer should be pruned: //pkg:tool is unchanged per DependencyHashes")
+	}
+}

@@ -1,11 +1,15 @@
 package pkg
 
 import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -364,7 +368,165 @@ func TestPersistenceModesPreserveHashesAndGeneratedFileEdges(t *testing.T) {
 	if got := seedable.TargetEdges[outputLabel.String()]; len(got) != 1 || got[0] != generatorLabel.String() {
 		t.Fatalf("seedable generated-file edge = %v, want [%s]", got, generatorLabel)
 	}
-	if !reflect.DeepEqual(seedable.TargetHashes, legacy.TargetHashes) {
-		t.Fatalf("seedable hashes differ from legacy hashes:\nseedable: %v\nlegacy: %v", seedable.TargetHashes, legacy.TargetHashes)
+	// Seedable hashes are a superset of legacy hashes — they include
+	// dependency-only targets (e.g. generated files) that appear in the
+	// edge map but not in MatchingTargets.
+	for label, legacyConfigs := range legacy.TargetHashes {
+		seedableConfigs, ok := seedable.TargetHashes[label]
+		if !ok {
+			t.Fatalf("seedable hashes missing legacy label %s", label)
+		}
+		if !reflect.DeepEqual(seedableConfigs, legacyConfigs) {
+			t.Fatalf("seedable hashes for %s differ from legacy: seedable=%v legacy=%v", label, seedableConfigs, legacyConfigs)
+		}
+	}
+	// The generated file's hash belongs in DependencyHashes, never in
+	// TargetHashes: diffing compares the target set, so a dependency label
+	// appearing there surfaces as a spurious added target.
+	if _, ok := seedable.DependencyHashes[outputLabel.String()]; !ok {
+		t.Fatal("seedable output should record //gen:output in DependencyHashes")
+	}
+	if _, ok := seedable.TargetHashes[outputLabel.String()]; ok {
+		t.Fatal("//gen:output must not leak into TargetHashes")
+	}
+}
+
+func TestAddDependencyHashesCoversEdgeKeysAndDependencyValues(t *testing.T) {
+	filled := func(b byte) []byte { return bytes.Repeat([]byte{b}, sha256.Size) }
+
+	cache := NewTargetHashCache(nil, &Normalizer{}, "release 8.0.0", true, nil)
+	if err := cache.SeedHashes(map[string][]byte{
+		"//pkg:rule\x00":     filled(0x11),
+		"//pkg:leaf.txt\x00": filled(0x22),
+		"//pkg:already\x00":  filled(0x33),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// leaf.txt appears only as a dependency value, never as a key — the
+	// shape that leaves a label unhashable by the probe if missed.
+	edges := map[string][]string{
+		"//pkg:rule":    {"//pkg:leaf.txt"},
+		"//pkg:already": {},
+	}
+	targetHashes := map[string]map[string]string{
+		"//pkg:already": {"": "preexisting"},
+	}
+
+	dependencyHashes := ExtractDependencyHashes(targetHashes, edges, cache)
+
+	if got := dependencyHashes["//pkg:rule"][""]; got != hex.EncodeToString(filled(0x11)) {
+		t.Errorf("edge key //pkg:rule not added, got %q", got)
+	}
+	if got := dependencyHashes["//pkg:leaf.txt"][""]; got != hex.EncodeToString(filled(0x22)) {
+		t.Errorf("dependency-value-only //pkg:leaf.txt not added, got %q", got)
+	}
+	if got := targetHashes["//pkg:already"][""]; got != "preexisting" {
+		t.Errorf("existing hash overwritten with %q", got)
+	}
+	if _, ok := dependencyHashes["//pkg:already"]; ok {
+		t.Error("a label already in targetHashes must not be duplicated into dependencyHashes")
+	}
+}
+
+func TestAddDependencyHashesSkipsEmptyHashSentinel(t *testing.T) {
+	// The cache returns a zero-length sentinel instead of a hash when a
+	// label's file is missing or is a directory. Persisting it would make
+	// the whole seed fail validation.
+	cache := NewTargetHashCache(nil, &Normalizer{}, "release 8.0.0", true, nil)
+	if err := cache.SeedHashes(map[string][]byte{
+		"//pkg:real\x00":    bytes.Repeat([]byte{0x44}, sha256.Size),
+		"//pkg:missing\x00": {},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	dependencyHashes := ExtractDependencyHashes(map[string]map[string]string{}, map[string][]string{
+		"//pkg:real": {"//pkg:missing"},
+	}, cache)
+
+	if _, ok := dependencyHashes["//pkg:real"]; !ok {
+		t.Error("//pkg:real should have been added")
+	}
+	if got, ok := dependencyHashes["//pkg:missing"]; ok {
+		t.Errorf("empty-hash sentinel should not be persisted, got %v", got)
+	}
+}
+
+func TestExtractEdgesOmitsTargetsWithoutDependencies(t *testing.T) {
+	// A dependency-less target must not appear in the edge map at all.
+	// Appending an empty slice would create the key with a nil value,
+	// which serialises as null and inflates the artifact.
+	configuration := NormalizeConfiguration("")
+	leaf := mustParseLabel("//pkg:leaf")
+	consumer := mustParseLabel("//pkg:consumer")
+	transitive := map[gazelle_label.Label]map[Configuration]*analysis.ConfiguredTarget{
+		leaf: {configuration: {Target: &build.Target{
+			Type: build.Target_RULE.Enum(),
+			Rule: &build.Rule{Name: proto.String(leaf.String()), RuleClass: proto.String("filegroup")},
+		}}},
+		consumer: {configuration: {Target: &build.Target{
+			Type: build.Target_RULE.Enum(),
+			Rule: &build.Rule{
+				Name: proto.String(consumer.String()), RuleClass: proto.String("java_library"),
+				// The same input twice: deduplication must survive the
+				// switch from a set to sort-and-compact.
+				RuleInput: []string{leaf.String(), leaf.String()},
+			},
+		}}},
+	}
+	queryResults := &QueryResults{
+		TransitiveConfiguredTargets: transitive,
+		TargetHashCache:             NewTargetHashCache(transitive, &Normalizer{}, "release 8.0.0", true, nil),
+	}
+
+	edges, err := ExtractEdges(queryResults)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, ok := edges[leaf.String()]; ok {
+		t.Errorf("dependency-less %s should be absent, got %v", leaf, edges[leaf.String()])
+	}
+	if got := edges[consumer.String()]; len(got) != 1 || got[0] != leaf.String() {
+		t.Errorf("consumer edges = %v, want exactly one %s", got, leaf)
+	}
+}
+
+func TestExtractEdgesCanonicalisesRepeatedLabelsConsistently(t *testing.T) {
+	// The canonicalisation memo must return what parsing would, including
+	// for "//pkg:pkg", which canonicalises to "//pkg". Shortcutting on the
+	// label's shape would break this.
+	configuration := NormalizeConfiguration("")
+	consumer := mustParseLabel("//app:consumer")
+	transitive := map[gazelle_label.Label]map[Configuration]*analysis.ConfiguredTarget{
+		consumer: {configuration: {Target: &build.Target{
+			Type: build.Target_RULE.Enum(),
+			Rule: &build.Rule{
+				Name: proto.String(consumer.String()), RuleClass: proto.String("java_library"),
+				RuleInput: []string{"//pkg:pkg", "@//other:thing", "//pkg:pkg"},
+			},
+		}}},
+	}
+	queryResults := &QueryResults{
+		TransitiveConfiguredTargets: transitive,
+		TargetHashCache:             NewTargetHashCache(transitive, &Normalizer{}, "release 8.0.0", true, nil),
+	}
+
+	edges, err := ExtractEdges(queryResults)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	normalizer := &Normalizer{}
+	for _, input := range []string{"//pkg:pkg", "@//other:thing"} {
+		parsed, err := normalizer.ParseCanonicalLabel(input)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !slices.Contains(edges[consumer.String()], parsed.String()) {
+			t.Errorf("%q should appear canonicalised as %q, got %v",
+				input, parsed.String(), edges[consumer.String()])
+		}
 	}
 }

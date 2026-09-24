@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -214,6 +215,42 @@ func (thc *TargetHashCache) ExtractHashes() map[string][]byte {
 		}
 	}
 	return result
+}
+
+// ExtractHexHashes is ExtractHashes with the hashes hex-encoded, matching
+// the representation used in persisted hash files.
+func (thc *TargetHashCache) ExtractHexHashes() map[string]string {
+	raw := thc.ExtractHashes()
+	hashes := make(map[string]string, len(raw))
+	for key, hash := range raw {
+		hashes[key] = hex.EncodeToString(hash)
+	}
+	return hashes
+}
+
+// SourceFileLabels returns the labels in the cache's query context that are
+// source files. Whether a source file changed is answered by the git diff,
+// so these labels need neither a persisted hash nor a hash comparison.
+func (thc *TargetHashCache) SourceFileLabels() map[string]bool {
+	sourceFiles := make(map[string]bool)
+	for label, configurations := range thc.context {
+		for _, configuredTarget := range configurations {
+			if configuredTarget.GetTarget().GetType() == build.Target_SOURCE_FILE {
+				sourceFiles[label.String()] = true
+				break
+			}
+		}
+	}
+	return sourceFiles
+}
+
+// splitHashKey splits a "<label>\x00<configuration>" cache key.
+func splitHashKey(key string) (label, configuration string, ok bool) {
+	idx := strings.IndexByte(key, '\x00')
+	if idx < 0 {
+		return "", "", false
+	}
+	return key[:idx], key[idx+1:], true
 }
 
 // RestoreHashes populates the cache with pre-computed hashes and freezes the cache.

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"slices"
 	"sort"
 	"time"
 
@@ -43,8 +44,23 @@ type PersistedHashData struct {
 	// independent) because CI uses --query-backend=query with a single null
 	// configuration.
 	TargetEdges map[string][]string `json:"target_edges,omitempty"`
+	// DependencyHashes holds hashes for labels that appear in TargetEdges
+	// without being matching targets, such as manual-tagged deps and
+	// platform() rules. Incremental hashing needs them to tell whether such
+	// a label changed, but they are not part of the target set and must
+	// stay out of TargetHashes, which is what diffing compares.
+	DependencyHashes map[string]map[string]string `json:"dependency_hashes,omitempty"`
 	// Metadata contains additional information about the computation
 	Metadata HashMetadata `json:"metadata"`
+}
+
+// SeedHashes returns the recorded per-configuration hashes for a label,
+// whether it was persisted as a matching target or as a dependency.
+func (d *PersistedHashData) SeedHashes(label string) map[string]string {
+	if hashes, ok := d.TargetHashes[label]; ok {
+		return hashes
+	}
+	return d.DependencyHashes[label]
 }
 
 // SeedCompatibility describes every invocation-level input that must remain
@@ -89,43 +105,63 @@ type HashMetadata struct {
 // making the graph conservative. Because seeded mode is query-only in normal
 // operation, each label ordinarily has a single null configuration.
 func ExtractEdges(queryResults *QueryResults) (map[string][]string, error) {
-	edgeSets := make(map[string]map[string]struct{})
 	edges := make(map[string][]string)
+
+	// Rule inputs arrive as strings and leave as strings, but each one has
+	// to be canonicalised in between, which parses it into a Label and
+	// formats it back. There are an order of magnitude more occurrences
+	// than distinct labels, so canonicalise each distinct string once.
+	//
+	// Shortcutting on the label's shape instead would be wrong: "//pkg:pkg"
+	// canonicalises to "//pkg", and skipping that would produce labels
+	// inconsistent with how matching targets are recorded.
+	canonical := make(map[string]string)
+	canonicalise := func(input string) (string, error) {
+		if cached, ok := canonical[input]; ok {
+			return cached, nil
+		}
+		parsed, err := queryResults.TargetHashCache.ParseCanonicalLabel(input)
+		if err != nil {
+			return "", err
+		}
+		result := parsed.String()
+		canonical[input] = result
+		return result, nil
+	}
 
 	for lbl, configMap := range queryResults.TransitiveConfiguredTargets {
 		lblStr := lbl.String()
 		for _, ct := range configMap {
 			target := ct.GetTarget()
-			var dependencyLabels []gazelle_label.Label
+			var dependencies []string
 			switch target.GetType() {
 			case build.Target_RULE:
-				var err error
-				dependencyLabels, err = canonicalRuleInputLabels(queryResults.TargetHashCache, target.GetRule())
-				if err != nil {
-					return nil, fmt.Errorf("failed to extract dependencies of %s: %w", lblStr, err)
+				for _, input := range target.GetRule().RuleInput {
+					dep, err := canonicalise(input)
+					if err != nil {
+						return nil, fmt.Errorf("failed to extract dependencies of %s: %w", lblStr, err)
+					}
+					dependencies = append(dependencies, dep)
 				}
 			case build.Target_GENERATED_FILE:
 				generatingRule, err := canonicalGeneratingRuleLabel(queryResults.TargetHashCache, target.GetGeneratedFile())
 				if err != nil {
 					return nil, fmt.Errorf("failed to extract dependencies of %s: %w", lblStr, err)
 				}
-				dependencyLabels = append(dependencyLabels, generatingRule)
+				dependencies = append(dependencies, generatingRule.String())
 			}
-			if len(dependencyLabels) > 0 {
-				if edgeSets[lblStr] == nil {
-					edgeSets[lblStr] = make(map[string]struct{})
-				}
-				for _, dep := range dependencyLabels {
-					edgeSets[lblStr][dep.String()] = struct{}{}
-				}
+			if len(dependencies) > 0 {
+				edges[lblStr] = append(edges[lblStr], dependencies...)
 			}
 		}
 	}
-	for lbl, deps := range edgeSets {
-		for dep := range deps {
-			edges[lbl] = append(edges[lbl], dep)
-		}
-		sort.Strings(edges[lbl])
+
+	// Deduplicating by sorting and compacting, rather than through a set,
+	// avoids hashing every dependency string. The result is sorted either
+	// way, and a label may repeat across configurations.
+	for lbl, deps := range edges {
+		sort.Strings(deps)
+		edges[lbl] = slices.Compact(deps)
 	}
 	return edges, nil
 }
@@ -183,6 +219,7 @@ func persistHashes(filePath string, gitCommitSha string, queryResults *QueryResu
 		if err != nil {
 			return fmt.Errorf("failed to extract target edges: %w", err)
 		}
+		persistedData.DependencyHashes = ExtractDependencyHashes(targetHashes, targetEdges, queryResults.TargetHashCache)
 		compatibilityFingerprint, err := ComputeSeedCompatibilityFingerprint(context, targetsPattern, queryResults.BazelRelease)
 		if err != nil {
 			return err
@@ -193,6 +230,70 @@ func persistHashes(filePath string, gitCommitSha string, queryResults *QueryResu
 	}
 
 	return writePersistedData(filePath, &persistedData, !seedable)
+}
+
+// ExtractDependencyHashes returns hashes for labels that appear in the edge
+// map but are not matching targets — manual-tagged deps, platform() rules,
+// generated file outputs. Their hashes were already computed in the cache
+// via recursive Hash() calls, so recording them is free, and without them
+// incremental hashing cannot tell whether such a label changed and must
+// conservatively propagate its reverse dependencies.
+//
+// They are returned separately rather than merged into targetHashes: only
+// matching targets belong in the target set that diffing compares, and
+// mixing these in makes them surface as spurious added targets.
+//
+// Source files are deliberately excluded. The git diff already says whether
+// a file changed, so hashing one to rediscover that is redundant, and they
+// outnumber the labels that do need a hash by more than twenty to one.
+func ExtractDependencyHashes(targetHashes map[string]map[string]string, edges map[string][]string, cache *TargetHashCache) map[string]map[string]string {
+	sourceFiles := cache.SourceFileLabels()
+
+	// Both edge keys and dependency values: leaf labels (npm /ref targets)
+	// never appear as keys, so iterating keys alone misses them.
+	wanted := make(map[string]bool)
+	consider := func(label string) {
+		if _, ok := targetHashes[label]; ok {
+			return
+		}
+		if sourceFiles[label] {
+			return
+		}
+		wanted[label] = true
+	}
+	for label, deps := range edges {
+		consider(label)
+		for _, dep := range deps {
+			consider(dep)
+		}
+	}
+	if len(wanted) == 0 {
+		return nil
+	}
+
+	dependencyHashes := make(map[string]map[string]string)
+	for key, hashHex := range cache.ExtractHexHashes() {
+		label, configuration, ok := splitHashKey(key)
+		if !ok || !wanted[label] {
+			continue
+		}
+		// The cache yields a zero-length sentinel rather than a hash for
+		// labels whose file does not exist or is a directory. Persisting
+		// one would fail seed validation, which requires every hash to be
+		// sha256-sized, and cause the whole seed to be rejected. Omitting
+		// the label instead just makes incremental hashing treat it as
+		// changed, which is the safe direction.
+		if len(hashHex) != hex.EncodedLen(sha256.Size) {
+			continue
+		}
+		configs := dependencyHashes[label]
+		if configs == nil {
+			configs = make(map[string]string)
+			dependencyHashes[label] = configs
+		}
+		configs[configuration] = hashHex
+	}
+	return dependencyHashes
 }
 
 // WritePersistedData writes a PersistedHashData struct directly to a JSON file.

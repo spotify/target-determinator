@@ -280,3 +280,23 @@ func TestMergePersistedEntriesReplacesDirtyState(t *testing.T) {
 		t.Fatalf("merged edges = %#v, want %#v", got, wantEdges)
 	}
 }
+
+func TestBuildProbePattern(t *testing.T) {
+	// ":*" rather than ":all" so source files are covered, and no targets
+	// pattern wrapper so manual-tagged targets are not filtered out.
+	for _, tc := range []struct {
+		name     string
+		packages []string
+		want     string
+	}{
+		{"empty", nil, "set()"},
+		{"root", []string{"//"}, "(//:*)"},
+		{"several", []string{"//", "//ci", "//tools/binaries"}, "(//:* + //ci:* + //tools/binaries:*)"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := buildProbePattern(tc.packages); got != tc.want {
+				t.Errorf("buildProbePattern(%v) = %q, want %q", tc.packages, got, tc.want)
+			}
+		})
+	}
+}
