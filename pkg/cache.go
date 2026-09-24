@@ -112,12 +112,15 @@ func collectCacheContextFields(ctx *Context) map[string]interface{} {
 		fingerprints[i] = fp.String()
 	}
 	sort.Strings(fingerprints)
+	opaqueInputRepositories := append([]string(nil), ctx.OpaqueInputRepositories...)
+	sort.Strings(opaqueInputRepositories)
 	return map[string]interface{}{
 		"BazelCmd":                  ctx.BazelCmd.HashKey(),
 		"IgnoredFiles":              ignoredFiles,
 		"FilterIncompatibleTargets": ctx.FilterIncompatibleTargets,
 		"QueryBackend":              ctx.QueryBackend,
 		"RuleClassFingerprints":     fingerprints,
+		"OpaqueInputRepositories":   opaqueInputRepositories,
 	}
 }
 
@@ -181,7 +184,7 @@ func LoadFromCache(context *Context, treeSHA string, targetPattern string) (*Que
 	queryResults := &QueryResults{
 		MatchingTargets:             matchingTargets,
 		TransitiveConfiguredTargets: nil,
-		TargetHashCache:             NewTargetHashCache(nil, &normalizer, serialized.BazelRelease, false, nil),
+		TargetHashCache:             NewTargetHashCache(nil, &normalizer, serialized.BazelRelease, false, nil, context.OpaqueInputRepositories...),
 		BazelRelease:                serialized.BazelRelease,
 	}
 

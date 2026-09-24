@@ -19,7 +19,7 @@ const (
 	CurrentPersistedHashFormatVersion = 9
 	// HashAlgorithmVersion must change whenever target hashing or persisted
 	// dependency semantics change in a way that makes old hashes unsafe to seed.
-	HashAlgorithmVersion = 1
+	HashAlgorithmVersion = 2
 )
 
 // PersistedHashData represents the structure of a persisted hash file

@@ -36,10 +36,22 @@ func NewTargetHashCache(
 	bazelRelease string,
 	forceDisableConfiguredRuleInputs bool,
 	ruleClassFingerprints []RuleClassFingerprintDigests,
+	opaqueInputRepositories ...string,
 ) *TargetHashCache {
 	bazelVersionSupportsConfiguredRuleInputs := isConfiguredRuleInputsSupported(bazelRelease)
 	if forceDisableConfiguredRuleInputs {
 		bazelVersionSupportsConfiguredRuleInputs = false
+	}
+
+	canonicalOpaqueRepositories := make(map[string]struct{}, len(opaqueInputRepositories))
+	for _, repository := range opaqueInputRepositories {
+		canonicalRepository := repository
+		if mapped, ok := normalizer.Mapping[repository]; ok {
+			canonicalRepository = mapped
+		}
+		if canonicalRepository != "" {
+			canonicalOpaqueRepositories[canonicalRepository] = struct{}{}
+		}
 	}
 
 	return &TargetHashCache{
@@ -53,6 +65,7 @@ func NewTargetHashCache(
 		cache:                                    make(map[gazelle_label.Label]map[Configuration]*cacheEntry),
 		frozen:                                   false,
 		ruleClassFingerprints:                    ruleClassFingerprints,
+		opaqueInputRepositories:                  canonicalOpaqueRepositories,
 	}
 }
 
@@ -106,7 +119,8 @@ type TargetHashCache struct {
 	cacheLock sync.Mutex
 	cache     map[gazelle_label.Label]map[Configuration]*cacheEntry
 
-	ruleClassFingerprints []RuleClassFingerprintDigests
+	ruleClassFingerprints   []RuleClassFingerprintDigests
+	opaqueInputRepositories map[string]struct{}
 
 	// HashDebug, when true, logs per-component hash contributions for each target.
 	HashDebug bool
@@ -547,6 +561,17 @@ func hashTarget(thc *TargetHashCache, labelAndConfiguration LabelAndConfiguratio
 	configuredTarget, ok := configurationMap[configuration]
 	if !ok {
 		return nil, fmt.Errorf("label %s configuration %s not found in contxt: %w", label, configuration, labelNotFound)
+	}
+	if _, opaque := thc.opaqueInputRepositories[label.Repo]; label.Repo != "" && opaque {
+		hasher := sha256.New()
+		hasher.Write([]byte("target-determinator:opaque-input:v1"))
+		writeLabel(hasher, label)
+		hasher.Write(configuration.ForHashing())
+		hash := hasher.Sum(nil)
+		if thc.HashDebug {
+			log.Printf("hash-debug: opaque_input %s config=%s hash=%x", label, configuration, hash)
+		}
+		return hash, nil
 	}
 	target := configuredTarget.Target
 	switch target.GetType() {

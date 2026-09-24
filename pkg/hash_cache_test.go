@@ -13,6 +13,8 @@ import (
 	"github.com/bazel-contrib/target-determinator/third_party/protobuf/bazel/build"
 	"github.com/bazelbuild/bazel-gazelle/label"
 	"github.com/otiai10/copy"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -449,6 +451,66 @@ func mustParseLabel(s string) label.Label {
 		panic(err)
 	}
 	return l
+}
+
+func TestOpaqueInputRepositoryIgnoresContentsButPreservesIdentity(t *testing.T) {
+	configuration := NormalizeConfiguration("")
+	externalLabel := mustParseLabel("@@+snapshot+api//:schema.yaml")
+	otherExternalLabel := mustParseLabel("@@+snapshot+api//:other.yaml")
+	consumerLabel := mustParseLabel("//app:consumer")
+	schemaPath := filepath.Join(t.TempDir(), "schema.yaml")
+	require.NoError(t, os.WriteFile(schemaPath, []byte("version one"), 0o644))
+
+	newCache := func(opaqueRepositories []string) *TargetHashCache {
+		context := map[label.Label]map[Configuration]*analysis.ConfiguredTarget{
+			externalLabel: {configuration: {Target: &build.Target{
+				Type: build.Target_SOURCE_FILE.Enum(),
+				SourceFile: &build.SourceFile{
+					Name:     proto.String(externalLabel.String()),
+					Location: proto.String(schemaPath + ":1:1"),
+				},
+			}}},
+			otherExternalLabel: {configuration: {Target: &build.Target{
+				Type: build.Target_SOURCE_FILE.Enum(),
+				SourceFile: &build.SourceFile{
+					Name:     proto.String(otherExternalLabel.String()),
+					Location: proto.String(schemaPath + ":1:1"),
+				},
+			}}},
+			consumerLabel: {configuration: {Target: &build.Target{
+				Type: build.Target_RULE.Enum(),
+				Rule: &build.Rule{
+					Name:      proto.String(consumerLabel.String()),
+					RuleClass: proto.String("filegroup"),
+					RuleInput: []string{"@snapshot//:schema.yaml"},
+				},
+			}}},
+		}
+		normalizer := &Normalizer{Mapping: map[string]string{"snapshot": "+snapshot+api"}}
+		return NewTargetHashCache(context, normalizer, "release 8.0.0", true, nil, opaqueRepositories...)
+	}
+
+	consumer := LabelAndConfiguration{Label: consumerLabel, Configuration: configuration}
+	beforeOpaque, err := newCache([]string{"snapshot"}).Hash(consumer)
+	require.NoError(t, err)
+	beforeRecursive, err := newCache(nil).Hash(consumer)
+	require.NoError(t, err)
+
+	require.NoError(t, os.WriteFile(schemaPath, []byte("version two"), 0o644))
+	afterOpaque, err := newCache([]string{"snapshot"}).Hash(consumer)
+	require.NoError(t, err)
+	afterRecursive, err := newCache(nil).Hash(consumer)
+	require.NoError(t, err)
+
+	assert.Equal(t, beforeOpaque, afterOpaque, "opaque repository contents should not affect a consumer hash")
+	assert.NotEqual(t, beforeRecursive, afterRecursive, "ordinary external repository contents should affect a consumer hash")
+
+	cache := newCache([]string{"snapshot"})
+	firstIdentity, err := cache.Hash(LabelAndConfiguration{Label: externalLabel, Configuration: configuration})
+	require.NoError(t, err)
+	secondIdentity, err := cache.Hash(LabelAndConfiguration{Label: otherExternalLabel, Configuration: configuration})
+	require.NoError(t, err)
+	assert.NotEqual(t, firstIdentity, secondIdentity, "opaque target labels should remain part of the hash")
 }
 
 func TestRuleClassFingerprintMixing(t *testing.T) {

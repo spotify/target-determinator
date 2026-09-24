@@ -259,6 +259,10 @@ func TestSeedCompatibilityFingerprintChangesWithHashingInputs(t *testing.T) {
 			ctx.RuleClassFingerprints = []RuleClassFingerprint{{RuleClassGlobs: []string{"java_*"}, Files: []string{"versions.txt"}}}
 			return "//..."
 		},
+		"opaque input repositories": func(ctx *Context) string {
+			ctx.OpaqueInputRepositories = []string{"snapshot"}
+			return "//..."
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			changed := *base

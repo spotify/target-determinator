@@ -158,6 +158,9 @@ type Context struct {
 	// that the loading phase doesn't see (e.g., a sub-module MODULE.bazel referenced via
 	// local_path_override that pins a toolchain version).
 	RuleClassFingerprints []RuleClassFingerprint
+	// OpaqueInputRepositories lists external repositories whose targets contribute their canonical
+	// identity, but not their contents or transitive dependencies, to recursive target hashes.
+	OpaqueInputRepositories []string
 	// HashDebug enables per-target hash component logging for debugging non-deterministic hashes.
 	HashDebug bool `results_cache_key_ignore:"true"`
 }
@@ -924,7 +927,7 @@ func doQueryDeps(context *Context, targets TargetsList) (*QueryResults, error) {
 				labelsToConfigurations: nil,
 			},
 			TransitiveConfiguredTargets: nil,
-			TargetHashCache:             NewTargetHashCache(nil, &normalizer, bazelRelease, false, ruleClassFingerprintDigests),
+			TargetHashCache:             NewTargetHashCache(nil, &normalizer, bazelRelease, false, ruleClassFingerprintDigests, context.OpaqueInputRepositories...),
 			BazelRelease:                bazelRelease,
 			QueryError:                  retErr,
 		}, retErr
@@ -988,7 +991,7 @@ func doQueryDeps(context *Context, targets TargetsList) (*QueryResults, error) {
 	queryResults := &QueryResults{
 		MatchingTargets:             matchingTargets,
 		TransitiveConfiguredTargets: transitiveConfiguredTargets,
-		TargetHashCache:             NewTargetHashCache(transitiveConfiguredTargets, &normalizer, bazelRelease, false, ruleClassFingerprintDigests),
+		TargetHashCache:             NewTargetHashCache(transitiveConfiguredTargets, &normalizer, bazelRelease, false, ruleClassFingerprintDigests, context.OpaqueInputRepositories...),
 		BazelRelease:                bazelRelease,
 		QueryError:                  nil,
 		configurations:              configurations,
@@ -1007,7 +1010,7 @@ func doQueryDepsQueryMode(context *Context, targets TargetsList, normalizer *Nor
 				labelsToConfigurations: nil,
 			},
 			TransitiveConfiguredTargets: nil,
-			TargetHashCache:             NewTargetHashCache(nil, normalizer, bazelRelease, true, ruleClassFingerprintDigests),
+			TargetHashCache:             NewTargetHashCache(nil, normalizer, bazelRelease, true, ruleClassFingerprintDigests, context.OpaqueInputRepositories...),
 			BazelRelease:                bazelRelease,
 			QueryError:                  retErr,
 		}, retErr
@@ -1048,7 +1051,7 @@ func doQueryDepsQueryMode(context *Context, targets TargetsList, normalizer *Nor
 	queryResults := &QueryResults{
 		MatchingTargets:             matchingTargets,
 		TransitiveConfiguredTargets: transitiveConfiguredTargets,
-		TargetHashCache:             NewTargetHashCache(transitiveConfiguredTargets, normalizer, bazelRelease, true, ruleClassFingerprintDigests),
+		TargetHashCache:             NewTargetHashCache(transitiveConfiguredTargets, normalizer, bazelRelease, true, ruleClassFingerprintDigests, context.OpaqueInputRepositories...),
 		BazelRelease:                bazelRelease,
 		QueryError:                  nil,
 		configurations:              map[Configuration]singleConfigurationOutput{},
