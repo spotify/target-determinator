@@ -745,8 +745,11 @@ func TestIsFallbackTriggerLockfiles(t *testing.T) {
 		// "-lock" or "_lock" name stem.
 		{"pnpm-lock.yaml", true},
 		{"package-lock.json", true},
+		{"requirements_lock.txt", true},
 
-		// An unrecognised extension stays conservative and still triggers.
+		// Extensions that could hold dependency data stay conservative, as
+		// does an unrecognised one.
+		{"deps-lock.xml", true},
 		{"deps-lock.xyz", true},
 
 		// Ordinary files merely named after a lock must not trigger.
@@ -754,7 +757,6 @@ func TestIsFallbackTriggerLockfiles(t *testing.T) {
 		{"regen-pnpm-lock.sh", false},
 		{"repin-with-lock.sh", false},
 		{"2x-lock.png", false},
-		{"db.carbon.leader-lock.xml", false},
 		{"02_add_and_lock.md", false},
 		{"v3__workflow_lock.sql", false},
 

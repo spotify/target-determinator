@@ -304,12 +304,19 @@ func propagateFrom(dirtyLabels, actuallyChanged map[string]bool, edges map[strin
 // nonLockfileExtensions are extensions a dependency lockfile never uses.
 // Lockfile detection matches on name fragments, so without this a script,
 // document or migration merely named after a lock forces a full rehash.
+//
+// Keep this list to executable code, images and prose. Anything that could
+// hold structured dependency data must stay off it, however unlikely it
+// looks: pip writes requirements_lock.txt, so ".txt" belongs to lockfiles,
+// and ".xml" is omitted for the same reason. Wrongly listing an extension
+// here silently under-reports impacted targets, which is far worse than the
+// redundant rehash a missing entry causes.
 var nonLockfileExtensions = map[string]bool{
-	".md": true, ".rst": true, ".txt": true,
+	".md": true, ".rst": true, ".html": true,
 	".png": true, ".jpg": true, ".jpeg": true, ".svg": true,
 	".sh": true, ".bash": true,
 	".go": true, ".java": true, ".py": true, ".ts": true, ".js": true,
-	".sql": true, ".xml": true, ".html": true,
+	".sql": true,
 }
 
 // looksLikeLockfile reports whether lowerBasename, already lowercased, names a
