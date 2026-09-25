@@ -301,14 +301,49 @@ func propagateFrom(dirtyLabels, actuallyChanged map[string]bool, edges map[strin
 	return result
 }
 
+// nonLockfileExtensions are extensions a dependency lockfile never uses.
+// Lockfile detection matches on name fragments, so without this a script,
+// document or migration merely named after a lock forces a full rehash.
+//
+// Keep this list to executable code, images and prose. Anything that could
+// hold structured dependency data must stay off it, however unlikely it
+// looks: pip writes requirements_lock.txt, so ".txt" belongs to lockfiles,
+// and ".xml" is omitted for the same reason. Wrongly listing an extension
+// here silently under-reports impacted targets, which is far worse than the
+// redundant rehash a missing entry causes.
+var nonLockfileExtensions = map[string]bool{
+	".md": true, ".rst": true, ".html": true,
+	".png": true, ".jpg": true, ".jpeg": true, ".svg": true,
+	".sh": true, ".bash": true,
+	".go": true, ".java": true, ".py": true, ".ts": true, ".js": true,
+	".sql": true,
+}
+
+// looksLikeLockfile reports whether lowerBasename, already lowercased, names a
+// dependency lockfile. Three shapes occur: a ".lock" extension (Cargo.lock,
+// buf.lock), ".lock" as an inner component (multitool.lock.json,
+// .terraform.lock.hcl), and a "-lock" or "_lock" name stem (pnpm-lock.yaml,
+// package-lock.json). Only the first is unambiguous; the other two also match
+// ordinary files that happen to be named after a lock, so they additionally
+// require an extension a lockfile could plausibly use.
+func looksLikeLockfile(lowerBasename string) bool {
+	if strings.HasSuffix(lowerBasename, ".lock") {
+		return true
+	}
+	if !strings.Contains(lowerBasename, ".lock.") &&
+		!strings.Contains(lowerBasename, "-lock.") &&
+		!strings.Contains(lowerBasename, "_lock.") {
+		return false
+	}
+	return !nonLockfileExtensions[filepath.Ext(lowerBasename)]
+}
+
 func isFallbackTrigger(basename string) bool {
 	if strings.HasSuffix(basename, ".bzl") {
 		return true
 	}
 	lowerBasename := strings.ToLower(basename)
-	if strings.HasSuffix(lowerBasename, ".lock") ||
-		strings.Contains(lowerBasename, "-lock.") ||
-		strings.Contains(lowerBasename, "_lock.") {
+	if looksLikeLockfile(lowerBasename) {
 		return true
 	}
 	if basename == ".bazelrc" || strings.HasPrefix(basename, ".bazelrc.") ||
