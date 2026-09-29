@@ -21,27 +21,37 @@ import (
 	"github.com/bazel-contrib/target-determinator/pkg"
 )
 
+type fallbackTriggerPatterns []string
+
+func (f *fallbackTriggerPatterns) String() string { return fmt.Sprintf("%v", *f) }
+func (f *fallbackTriggerPatterns) Set(value string) error {
+	*f = append(*f, value)
+	return nil
+}
+
 type hashPersisterFlags struct {
-	commonFlags     *cli.CommonFlags
-	commitSha       string
-	outputFile      string
-	seedableOutput  bool
-	seedFile        string
-	seedSha         string
-	reportFile      string
-	fallbackPercent int
+	commonFlags             *cli.CommonFlags
+	commitSha               string
+	outputFile              string
+	seedableOutput          bool
+	seedFile                string
+	seedSha                 string
+	reportFile              string
+	fallbackPercent         int
+	fallbackTriggerPatterns fallbackTriggerPatterns
 }
 
 type config struct {
-	Context         *pkg.Context
-	CommitSha       string
-	Targets         pkg.TargetsList
-	OutputFile      string
-	SeedableOutput  bool
-	SeedFile        string
-	SeedSha         string
-	ReportFile      string
-	FallbackPercent int
+	Context                 *pkg.Context
+	CommitSha               string
+	Targets                 pkg.TargetsList
+	OutputFile              string
+	SeedableOutput          bool
+	SeedFile                string
+	SeedSha                 string
+	ReportFile              string
+	FallbackPercent         int
+	FallbackTriggerPatterns []string
 }
 
 type seededOutcome struct {
@@ -248,7 +258,7 @@ func runSeeded(cfg *config) (seededOutcome, error) {
 
 	phaseStart = time.Now()
 	allLabels := pkg.CollectAllLabels(seedData.TargetEdges, seedData.TargetHashes)
-	dirtyResult := pkg.ComputeDirtySet(changedFiles, seedData.TargetEdges, allLabels, fingerprintFiles)
+	dirtyResult := pkg.ComputeDirtySet(changedFiles, seedData.TargetEdges, allLabels, fingerprintFiles, cfg.FallbackTriggerPatterns)
 	outcome.DirtyPackageCount = len(dirtyResult.DirtyPackages)
 	outcome.DirtyTargetCount = len(dirtyResult.DirtyStarLabels)
 	log.Printf("Dirty set computed in %v: %d dirty, %d dirty*, %d dirty packages (fallback=%v)",
@@ -699,6 +709,11 @@ func parseFlags() (*hashPersisterFlags, error) {
 		defaultRecomputationFallbackPercent,
 		"Fall back to full hashing when an incremental run would recompute at least this percentage of seeded targets (1-100)",
 	)
+	flag.Var(
+		&flags.fallbackTriggerPatterns,
+		"fallback-trigger-pattern",
+		"Additional file path pattern (Go path.Match syntax) that forces a full rehash when matched. Repeatable. Matched against the workspace-relative file path.",
+	)
 
 	flag.Parse()
 
@@ -787,15 +802,16 @@ func resolveConfig(flags hashPersisterFlags) (*config, error) {
 	}
 
 	return &config{
-		Context:         context,
-		CommitSha:       flags.commitSha,
-		Targets:         targetsList,
-		OutputFile:      flags.outputFile,
-		SeedableOutput:  seedableOutput,
-		SeedFile:        flags.seedFile,
-		SeedSha:         flags.seedSha,
-		ReportFile:      flags.reportFile,
-		FallbackPercent: flags.fallbackPercent,
+		Context:                 context,
+		CommitSha:               flags.commitSha,
+		Targets:                 targetsList,
+		OutputFile:              flags.outputFile,
+		SeedableOutput:          seedableOutput,
+		SeedFile:                flags.seedFile,
+		SeedSha:                 flags.seedSha,
+		ReportFile:              flags.reportFile,
+		FallbackPercent:         flags.fallbackPercent,
+		FallbackTriggerPatterns: flags.fallbackTriggerPatterns,
 	}, nil
 }
 

@@ -1,6 +1,7 @@
 package pkg
 
 import (
+	"path"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -57,6 +58,7 @@ func ComputeDirtySet(
 	edges map[string][]string,
 	allLabels map[string]bool,
 	ruleClassFingerprintFiles map[string]bool,
+	fallbackTriggerPatterns []string,
 ) *DirtySetResult {
 	result := &DirtySetResult{
 		DirtyLabels:     make(map[string]bool),
@@ -88,6 +90,15 @@ func ComputeDirtySet(
 			result.FallbackCode = "rule_fingerprint_change"
 			result.FallbackReason = "rule-class fingerprint file changed: " + filePath
 			return result
+		}
+
+		for _, pattern := range fallbackTriggerPatterns {
+			if matched, _ := path.Match(pattern, filePath); matched {
+				result.NeedsFallback = true
+				result.FallbackCode = "unsafe_file_change"
+				result.FallbackReason = "file matched fallback trigger pattern " + pattern + ": " + filePath
+				return result
+			}
 		}
 
 		if isFallbackTrigger(base) {
