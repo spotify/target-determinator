@@ -16,7 +16,7 @@ func TestComputeDirtySetSourceFileChange(t *testing.T) {
 		"pkg/src.java": "M",
 	}
 
-	result := ComputeDirtySet(changedFiles, edges, allLabels, nil)
+	result := ComputeDirtySet(changedFiles, edges, allLabels, nil, nil)
 
 	if result.NeedsFallback {
 		t.Fatal("unexpected fallback")
@@ -44,7 +44,7 @@ func TestComputeDirtySetBUILDFileChange(t *testing.T) {
 		"pkg/BUILD.bazel": "M",
 	}
 
-	result := ComputeDirtySet(changedFiles, edges, allLabels, nil)
+	result := ComputeDirtySet(changedFiles, edges, allLabels, nil, nil)
 
 	if result.NeedsFallback {
 		t.Fatal("unexpected fallback")
@@ -74,7 +74,7 @@ func TestComputeDirtySetMainRootDoesNotDirtyExternalRootLabels(t *testing.T) {
 	allLabels := CollectAllLabels(edges, nil)
 
 	result := ComputeDirtySet(
-		map[string]string{"root.txt": "M"}, edges, allLabels, nil,
+		map[string]string{"root.txt": "M"}, edges, allLabels, nil, nil,
 	)
 
 	if !result.DirtyLabels["//:main"] {
@@ -100,7 +100,7 @@ func TestComputeDirtySetMainPackageDoesNotDirtyExternalPackageLabels(t *testing.
 	allLabels := CollectAllLabels(edges, nil)
 
 	result := ComputeDirtySet(
-		map[string]string{"shared/source.txt": "M"}, edges, allLabels, nil,
+		map[string]string{"shared/source.txt": "M"}, edges, allLabels, nil, nil,
 	)
 
 	if !result.DirtyLabels["//shared:main"] {
@@ -126,7 +126,7 @@ func TestComputeDirtySetPropagatesThroughExternalLabels(t *testing.T) {
 	allLabels := CollectAllLabels(edges, nil)
 
 	result := ComputeDirtySet(
-		map[string]string{"pkg/source.txt": "M"}, edges, allLabels, nil,
+		map[string]string{"pkg/source.txt": "M"}, edges, allLabels, nil, nil,
 	)
 
 	for _, label := range []string{
@@ -154,7 +154,7 @@ func TestComputeDirtySetBzlFallback(t *testing.T) {
 		"tools/defs.bzl": "M",
 	}
 
-	result := ComputeDirtySet(changedFiles, edges, allLabels, nil)
+	result := ComputeDirtySet(changedFiles, edges, allLabels, nil, nil)
 
 	if !result.NeedsFallback {
 		t.Fatal("expected fallback for .bzl change")
@@ -172,7 +172,7 @@ func TestComputeDirtySetModuleBazelFallback(t *testing.T) {
 		"MODULE.bazel": "M",
 	}
 
-	result := ComputeDirtySet(changedFiles, nil, nil, nil)
+	result := ComputeDirtySet(changedFiles, nil, nil, nil, nil)
 
 	if !result.NeedsFallback {
 		t.Fatal("expected fallback for MODULE.bazel change")
@@ -184,7 +184,7 @@ func TestComputeDirtySetSubModuleBazelFallback(t *testing.T) {
 		"tools/modules/rules_java.MODULE.bazel": "M",
 	}
 
-	result := ComputeDirtySet(changedFiles, nil, nil, nil)
+	result := ComputeDirtySet(changedFiles, nil, nil, nil, nil)
 
 	if !result.NeedsFallback {
 		t.Fatal("expected fallback for *.MODULE.bazel change")
@@ -203,7 +203,7 @@ func TestComputeDirtySetDeletedBUILDFallsBack(t *testing.T) {
 		"deleted_pkg/BUILD.bazel": "D",
 	}
 
-	result := ComputeDirtySet(changedFiles, edges, allLabels, nil)
+	result := ComputeDirtySet(changedFiles, edges, allLabels, nil, nil)
 
 	if !result.NeedsFallback {
 		t.Fatal("expected fallback for deleted BUILD file")
@@ -223,7 +223,7 @@ func TestComputeDirtySetRenamedBUILDFallsBack(t *testing.T) {
 		"pkg/BUILD.bazel": "R100",
 	}
 
-	result := ComputeDirtySet(changedFiles, edges, allLabels, nil)
+	result := ComputeDirtySet(changedFiles, edges, allLabels, nil, nil)
 
 	if !result.NeedsFallback {
 		t.Fatal("expected fallback for renamed BUILD file")
@@ -240,7 +240,7 @@ func TestComputeDirtySetNewPackageFallsBack(t *testing.T) {
 		"newpkg/BUILD.bazel": "A",
 	}
 
-	result := ComputeDirtySet(changedFiles, edges, allLabels, nil)
+	result := ComputeDirtySet(changedFiles, edges, allLabels, nil, nil)
 
 	if !result.NeedsFallback {
 		t.Fatal("expected fallback for BUILD file of package unknown to seed")
@@ -260,7 +260,7 @@ func TestComputeDirtySetOwningPackageWalkUp(t *testing.T) {
 		"svc/src/main/java/App.java": "M",
 	}
 
-	result := ComputeDirtySet(changedFiles, edges, allLabels, nil)
+	result := ComputeDirtySet(changedFiles, edges, allLabels, nil, nil)
 
 	if result.NeedsFallback {
 		t.Fatalf("unexpected fallback: %s", result.FallbackReason)
@@ -286,7 +286,7 @@ func TestComputeDirtySetUnownedFileIgnored(t *testing.T) {
 		"docs/README.md": "M",
 	}
 
-	result := ComputeDirtySet(changedFiles, edges, allLabels, nil)
+	result := ComputeDirtySet(changedFiles, edges, allLabels, nil, nil)
 
 	if result.NeedsFallback {
 		t.Fatalf("unexpected fallback: %s", result.FallbackReason)
@@ -313,7 +313,7 @@ func TestComputeDirtySetDiamondRdeps(t *testing.T) {
 		"pkg/d.java": "M",
 	}
 
-	result := ComputeDirtySet(changedFiles, edges, allLabels, nil)
+	result := ComputeDirtySet(changedFiles, edges, allLabels, nil, nil)
 
 	for _, label := range []string{"//pkg:A", "//pkg:B", "//pkg:C", "//pkg:D", "//pkg:d.java"} {
 		if !result.DirtyStarLabels[label] {
@@ -331,7 +331,7 @@ func TestComputeDirtySetFingerprintFileFallback(t *testing.T) {
 		"tools/modules/rules_java.MODULE.bazel": "M",
 	}
 
-	result := ComputeDirtySet(changedFiles, nil, nil, fingerprints)
+	result := ComputeDirtySet(changedFiles, nil, nil, fingerprints, nil)
 
 	if !result.NeedsFallback {
 		t.Fatal("expected fallback for fingerprint file change")
@@ -340,7 +340,7 @@ func TestComputeDirtySetFingerprintFileFallback(t *testing.T) {
 
 func TestComputeDirtySetBazelrcFallback(t *testing.T) {
 	changedFiles := map[string]string{".bazelrc": "M"}
-	result := ComputeDirtySet(changedFiles, nil, nil, nil)
+	result := ComputeDirtySet(changedFiles, nil, nil, nil, nil)
 	if !result.NeedsFallback {
 		t.Fatal("expected fallback for .bazelrc change")
 	}
@@ -348,7 +348,7 @@ func TestComputeDirtySetBazelrcFallback(t *testing.T) {
 
 func TestComputeDirtySetBazelVersionFallback(t *testing.T) {
 	changedFiles := map[string]string{".bazelversion": "M"}
-	result := ComputeDirtySet(changedFiles, nil, nil, nil)
+	result := ComputeDirtySet(changedFiles, nil, nil, nil, nil)
 	if !result.NeedsFallback {
 		t.Fatal("expected fallback for .bazelversion change")
 	}
@@ -356,7 +356,7 @@ func TestComputeDirtySetBazelVersionFallback(t *testing.T) {
 
 func TestComputeDirtySetBazelIgnoreFallback(t *testing.T) {
 	changedFiles := map[string]string{".bazelignore": "M"}
-	result := ComputeDirtySet(changedFiles, nil, nil, nil)
+	result := ComputeDirtySet(changedFiles, nil, nil, nil, nil)
 	if !result.NeedsFallback {
 		t.Fatal("expected fallback for .bazelignore change")
 	}
@@ -380,11 +380,49 @@ func TestComputeDirtySetRepositoryMetadataFallbacks(t *testing.T) {
 		"config/common.rc",
 	} {
 		t.Run(path, func(t *testing.T) {
-			result := ComputeDirtySet(map[string]string{path: "M"}, nil, nil, nil)
+			result := ComputeDirtySet(map[string]string{path: "M"}, nil, nil, nil, nil)
 			if !result.NeedsFallback {
 				t.Fatalf("expected fallback for %s", path)
 			}
 		})
+	}
+}
+
+func TestComputeDirtySetFallbackTriggerPattern(t *testing.T) {
+	result := ComputeDirtySet(
+		map[string]string{"tools/savvy/etna.yaml": "M"},
+		nil, nil, nil,
+		[]string{"tools/savvy/etna.yaml"},
+	)
+	if !result.NeedsFallback {
+		t.Fatal("expected fallback for file matching fallback trigger pattern")
+	}
+	if result.FallbackCode != "unsafe_file_change" {
+		t.Errorf("FallbackCode = %q, want unsafe_file_change", result.FallbackCode)
+	}
+}
+
+func TestComputeDirtySetFallbackTriggerPatternGlob(t *testing.T) {
+	result := ComputeDirtySet(
+		map[string]string{"tools/savvy/etna.yaml": "M"},
+		nil, nil, nil,
+		[]string{"tools/savvy/*.yaml"},
+	)
+	if !result.NeedsFallback {
+		t.Fatal("expected fallback for file matching glob pattern")
+	}
+}
+
+func TestComputeDirtySetFallbackTriggerPatternNoMatch(t *testing.T) {
+	edges := map[string][]string{"//pkg:rule_a": {}}
+	allLabels := CollectAllLabels(edges, nil)
+	result := ComputeDirtySet(
+		map[string]string{"pkg/src.java": "M"},
+		edges, allLabels, nil,
+		[]string{"tools/savvy/*.yaml"},
+	)
+	if result.NeedsFallback {
+		t.Error("unexpected fallback for file not matching pattern")
 	}
 }
 
@@ -479,7 +517,7 @@ func TestPruneDirtySetEliminatesUnchangedRdeps(t *testing.T) {
 		"tools/binaries/BUILD.bazel": "M",
 	}
 
-	original := ComputeDirtySet(changedFiles, edges, allLabels, nil)
+	original := ComputeDirtySet(changedFiles, edges, allLabels, nil, nil)
 
 	// Verify the unpruned dirty set cascades broadly.
 	if !original.DirtyStarLabels["//app:binary"] {
@@ -538,7 +576,7 @@ func TestPruneDirtySetPreservesChangedRdeps(t *testing.T) {
 	allLabels := CollectAllLabels(edges, nil)
 
 	original := ComputeDirtySet(
-		map[string]string{"lib/BUILD.bazel": "M"}, edges, allLabels, nil,
+		map[string]string{"lib/BUILD.bazel": "M"}, edges, allLabels, nil, nil,
 	)
 
 	seedHashes := map[string]map[string]string{
@@ -570,7 +608,7 @@ func TestPruneDirtySetNoOpWhenAllChanged(t *testing.T) {
 	allLabels := CollectAllLabels(edges, nil)
 
 	original := ComputeDirtySet(
-		map[string]string{"pkg/BUILD.bazel": "M"}, edges, allLabels, nil,
+		map[string]string{"pkg/BUILD.bazel": "M"}, edges, allLabels, nil, nil,
 	)
 
 	seedHashes := map[string]map[string]string{
@@ -603,7 +641,7 @@ func TestPruneDirtySetJudgesSourceFilesByGitNotHash(t *testing.T) {
 	}
 	allLabels := CollectAllLabels(edges, nil)
 	original := ComputeDirtySet(
-		map[string]string{"pkg/edited.java": "M"}, edges, allLabels, nil,
+		map[string]string{"pkg/edited.java": "M"}, edges, allLabels, nil, nil,
 	)
 
 	// Both source files are directly dirty before pruning, and both
@@ -670,7 +708,7 @@ func TestPropagateTraversesThroughUnchangedDirtyLabels(t *testing.T) {
 	}
 	allLabels := CollectAllLabels(edges, nil)
 	original := ComputeDirtySet(
-		map[string]string{"pkg/src.java": "M"}, edges, allLabels, nil,
+		map[string]string{"pkg/src.java": "M"}, edges, allLabels, nil, nil,
 	)
 
 	unchanged := "bbbb0000bbbb0000bbbb0000bbbb0000bbbb0000bbbb0000bbbb0000bbbb0000"
@@ -704,7 +742,7 @@ func TestPruneDirtySetReadsDependencyHashes(t *testing.T) {
 	}
 	allLabels := CollectAllLabels(edges, nil)
 	original := ComputeDirtySet(
-		map[string]string{"pkg/BUILD.bazel": "M"}, edges, allLabels, nil,
+		map[string]string{"pkg/BUILD.bazel": "M"}, edges, allLabels, nil, nil,
 	)
 	if !original.DirtyStarLabels["//app:consumer"] {
 		t.Fatal("expected //app:consumer in unpruned DirtyStarLabels")
@@ -777,7 +815,7 @@ func TestComputeDirtySetNestedLockExtensionFallsBack(t *testing.T) {
 		"tools/multitool.lock.json": "M",
 	}
 
-	result := ComputeDirtySet(changedFiles, nil, nil, nil)
+	result := ComputeDirtySet(changedFiles, nil, nil, nil, nil)
 
 	if !result.NeedsFallback {
 		t.Fatal("expected fallback for multitool.lock.json change")
@@ -797,7 +835,7 @@ func TestComputeDirtySetLockNamedScriptDoesNotFallBack(t *testing.T) {
 		"tools/git/merge-pnpm-lock.sh": "M",
 	}
 
-	result := ComputeDirtySet(changedFiles, edges, allLabels, nil)
+	result := ComputeDirtySet(changedFiles, edges, allLabels, nil, nil)
 
 	if result.NeedsFallback {
 		t.Errorf("unexpected fallback for a shell script: %s", result.FallbackReason)
