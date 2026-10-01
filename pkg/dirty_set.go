@@ -146,7 +146,11 @@ func ComputeDirtySet(
 		}
 		// A directory is a package while it has a BUILD or a BUILD.bazel
 		// file, so deleting one only removes the package if the other is
-		// gone too. If the other file is in the diff, its status decides:
+		// gone too. A directory with both practically never happens (Bazel
+		// would read BUILD.bazel and ignore BUILD); this exists so that
+		// repositories using either name are handled correctly, and the
+		// typical case is simply "the package's only BUILD file was
+		// deleted". If the other file is in the diff, its status decides:
 		// deleted means the package is removed; added or modified means it
 		// survives and is handled like any edited BUILD file. If it is not
 		// in the diff, it either still exists unchanged or never existed,
