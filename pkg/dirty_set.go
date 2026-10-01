@@ -80,17 +80,20 @@ func ComputeDirtySet(
 	fallbackTriggerPatterns []string,
 	packagesExistAtTarget func(pkgs []string) (map[string]bool, error),
 ) *DirtySetResult {
+	// First pass: fallback triggers.
 	if code, reason, ok := findFallbackTrigger(changedFiles, ruleClassFingerprintFiles, fallbackTriggerPatterns); ok {
 		return fallbackResult(code, reason)
 	}
 
 	knownPackages, labelsByPackage := indexSeedPackages(allLabels)
+	// Package boundary changes.
 	boundaries, err := findBoundaryChanges(changedFiles, knownPackages, packagesExistAtTarget)
 	if err != nil {
 		return fallbackResult("package_lookup_error",
 			"cannot determine whether deleted packages still exist: "+err.Error())
 	}
 
+	// Second pass: map changed files to dirty packages and labels.
 	result := &DirtySetResult{DirtyLabels: make(map[string]bool)}
 	for pkg := range findDirtyPackages(changedFiles, knownPackages, boundaries) {
 		for _, label := range labelsByPackage[pkg] {
@@ -102,6 +105,8 @@ func ComputeDirtySet(
 	}
 	sort.Strings(result.DirtyPackages)
 	result.RemovedPackages = sortedKeys(boundaries.removed)
+
+	// Propagate dirtiness through reverse deps.
 	result.DirtyStarLabels = propagateFrom(result.DirtyLabels, result.DirtyLabels, edges)
 	return result
 }
@@ -276,12 +281,14 @@ func findDirtyPackages(
 			dirty[fileToPackage(filePath)] = true
 			continue
 		}
-		// A source file belongs to the nearest enclosing known package. With
-		// none, it cannot be an input to any seeded target (see
-		// ComputeDirtySet).
-		if owner, ok := owningPackage(filePath, knownPackages); ok {
-			dirty[owner] = true
+		// A source file belongs to the nearest enclosing known package.
+		owner, ok := owningPackage(filePath, knownPackages)
+		if !ok {
+			// No enclosing package: the file cannot be an input to any
+			// seeded target (see ComputeDirtySet).
+			continue
 		}
+		dirty[owner] = true
 	}
 	return dirty
 }
