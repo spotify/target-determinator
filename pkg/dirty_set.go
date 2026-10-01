@@ -1,6 +1,7 @@
 package pkg
 
 import (
+	"errors"
 	"path"
 	"path/filepath"
 	"sort"
@@ -13,11 +14,15 @@ type DirtySetResult struct {
 	DirtyLabels map[string]bool
 	// DirtyStarLabels is DirtyLabels plus all transitive reverse deps.
 	DirtyStarLabels map[string]bool
-	// DirtyPackages is the sorted list of packages containing changed files
-	// (source or BUILD). Targets in these packages must be re-listed with a
-	// package wildcard (e.g. //pkg:all) rather than by explicit label, so
-	// that targets added to or removed from the package are handled.
+	// DirtyPackages is the sorted list of packages, existing at the target
+	// revision, whose targets must be re-listed with a package wildcard
+	// (e.g. //pkg:all) rather than by explicit label, so that targets added
+	// to or removed from the package are handled.
 	DirtyPackages []string
+	// RemovedPackages is the sorted list of packages that no longer exist at
+	// the target revision. Their seed labels are in DirtyLabels, but they are
+	// never in DirtyPackages: there is nothing left to list.
+	RemovedPackages []string
 	// NeedsFallback is true when a change requires a full rehash.
 	NeedsFallback bool
 	// FallbackReason describes why a fallback was triggered.
@@ -48,23 +53,100 @@ type DirtySetResult struct {
 // the file. Files with no enclosing known package cannot be inputs to any
 // seeded target and are ignored.
 //
-// Fallback (full rehash) is triggered by files that can change loading,
-// repository resolution, or package boundaries without appearing in target
-// edges: Starlark, module/workspace/repository metadata, Bazel configuration,
-// rule-class fingerprint files, deleted or renamed BUILD files, and BUILD
-// files for packages unknown to the seed.
+// Adding or removing a package changes the hashes of only its own targets,
+// the targets of its nearest enclosing package (whose globs and
+// subpackages() results gain or lose the directory's files), and their
+// reverse deps. Packages further up cannot see past the enclosing package.
+// An added package is re-listed with a wildcard; a removed package's labels
+// are dropped. In both cases the nearest enclosing package at the seed and
+// at the target revision is dirtied as if its BUILD file had changed.
+//
+// packagesExistAtTarget reports which of the given packages still have a
+// BUILD or BUILD.bazel file at the target revision. A package survives the
+// deletion of one of those files if the other one remains. When the other
+// file also appears in the diff, its status answers that directly; only
+// the remaining deletions are looked up, all in a single call. If
+// packagesExistAtTarget is nil or fails, those deletions trigger a fallback.
+//
+// Fallback (full rehash) is triggered by files that can change loading or
+// repository resolution without appearing in target edges: Starlark,
+// module/workspace/repository metadata, Bazel configuration, and rule-class
+// fingerprint files.
 func ComputeDirtySet(
 	changedFiles map[string]string,
 	edges map[string][]string,
 	allLabels map[string]bool,
 	ruleClassFingerprintFiles map[string]bool,
 	fallbackTriggerPatterns []string,
+	packagesExistAtTarget func(pkgs []string) (map[string]bool, error),
 ) *DirtySetResult {
-	result := &DirtySetResult{
-		DirtyLabels:     make(map[string]bool),
-		DirtyStarLabels: make(map[string]bool),
+	// First pass: fallback triggers.
+	if code, reason, ok := findFallbackTrigger(changedFiles, ruleClassFingerprintFiles, fallbackTriggerPatterns); ok {
+		return fallbackResult(code, reason)
 	}
 
+	knownPackages, labelsByPackage := indexSeedPackages(allLabels)
+	// Package boundary changes.
+	boundaries, err := findBoundaryChanges(changedFiles, knownPackages, packagesExistAtTarget)
+	if err != nil {
+		return fallbackResult("package_lookup_error",
+			"cannot determine whether deleted packages still exist: "+err.Error())
+	}
+
+	// Second pass: map changed files to dirty packages and labels.
+	result := &DirtySetResult{DirtyLabels: make(map[string]bool)}
+	for pkg := range findDirtyPackages(changedFiles, knownPackages, boundaries) {
+		for _, label := range labelsByPackage[pkg] {
+			result.DirtyLabels[label] = true
+		}
+		if !boundaries.removed[pkg] {
+			result.DirtyPackages = append(result.DirtyPackages, pkg)
+		}
+	}
+	sort.Strings(result.DirtyPackages)
+	result.RemovedPackages = sortedKeys(boundaries.removed)
+
+	// Propagate dirtiness through reverse deps.
+	result.DirtyStarLabels = propagateFrom(result.DirtyLabels, result.DirtyLabels, edges)
+	return result
+}
+
+func fallbackResult(code, reason string) *DirtySetResult {
+	return &DirtySetResult{
+		DirtyLabels:     make(map[string]bool),
+		DirtyStarLabels: make(map[string]bool),
+		NeedsFallback:   true,
+		FallbackCode:    code,
+		FallbackReason:  reason,
+	}
+}
+
+// findFallbackTrigger reports the first changed file that forces a full
+// rehash, with its fallback code and reason.
+func findFallbackTrigger(
+	changedFiles map[string]string,
+	ruleClassFingerprintFiles map[string]bool,
+	fallbackTriggerPatterns []string,
+) (code, reason string, found bool) {
+	for filePath := range changedFiles {
+		if ruleClassFingerprintFiles[filePath] {
+			return "rule_fingerprint_change", "rule-class fingerprint file changed: " + filePath, true
+		}
+		for _, pattern := range fallbackTriggerPatterns {
+			if matched, _ := path.Match(pattern, filePath); matched {
+				return "unsafe_file_change", "file matched fallback trigger pattern " + pattern + ": " + filePath, true
+			}
+		}
+		if isFallbackTrigger(filepath.Base(filePath)) {
+			return "unsafe_file_change", "fallback trigger file changed: " + filePath, true
+		}
+	}
+	return "", "", false
+}
+
+// indexSeedPackages returns the main-workspace packages known to the seed and
+// their labels.
+func indexSeedPackages(allLabels map[string]bool) (map[string]bool, map[string][]string) {
 	knownPackages := make(map[string]bool)
 	labelsByPackage := make(map[string][]string)
 	for label := range allLabels {
@@ -80,105 +162,140 @@ func ComputeDirtySet(
 		knownPackages[pkg] = true
 		labelsByPackage[pkg] = append(labelsByPackage[pkg], label)
 	}
+	return knownPackages, labelsByPackage
+}
 
-	// First pass: fallback triggers.
+// boundaryChanges are the packages that appear or disappear between the seed
+// and the target revision.
+type boundaryChanges struct {
+	added   map[string]bool
+	removed map[string]bool
+}
+
+// findBoundaryChanges classifies changed BUILD files into added and removed
+// packages. It returns an error only when packagesExistAtTarget is needed and
+// is nil or fails.
+func findBoundaryChanges(
+	changedFiles map[string]string,
+	knownPackages map[string]bool,
+	packagesExistAtTarget func(pkgs []string) (map[string]bool, error),
+) (boundaryChanges, error) {
+	boundaries := boundaryChanges{added: make(map[string]bool), removed: make(map[string]bool)}
+	// Packages whose BUILD file was deleted but whose survival the diff
+	// alone cannot tell; resolved below with packagesExistAtTarget.
+	deletionsNeedingLookup := make(map[string]bool)
+
 	for filePath, status := range changedFiles {
-		base := filepath.Base(filePath)
-
-		if ruleClassFingerprintFiles[filePath] {
-			result.NeedsFallback = true
-			result.FallbackCode = "rule_fingerprint_change"
-			result.FallbackReason = "rule-class fingerprint file changed: " + filePath
-			return result
+		if !isBuildFile(filepath.Base(filePath)) {
+			continue
 		}
-
-		for _, pattern := range fallbackTriggerPatterns {
-			if matched, _ := path.Match(pattern, filePath); matched {
-				result.NeedsFallback = true
-				result.FallbackCode = "unsafe_file_change"
-				result.FallbackReason = "file matched fallback trigger pattern " + pattern + ": " + filePath
-				return result
+		pkg := fileToPackage(filePath)
+		if status != "D" {
+			if !knownPackages[pkg] {
+				boundaries.added[pkg] = true
 			}
+			continue
 		}
-
-		if isFallbackTrigger(base) {
-			result.NeedsFallback = true
-			result.FallbackCode = "unsafe_file_change"
-			result.FallbackReason = "fallback trigger file changed: " + filePath
-			return result
-		}
-
-		if base == "BUILD" || base == "BUILD.bazel" {
-			if status == "D" || strings.HasPrefix(status, "R") {
-				result.NeedsFallback = true
-				result.FallbackCode = "package_boundary_change"
-				result.FallbackReason = "package deleted or renamed: " + filePath
-				return result
-			}
-			if !knownPackages[fileToPackage(filePath)] {
-				result.NeedsFallback = true
-				result.FallbackCode = "package_boundary_change"
-				result.FallbackReason = "BUILD file for package unknown to seed: " + filePath
-				return result
-			}
+		// A directory is a package while it has a BUILD or a BUILD.bazel
+		// file, so deleting one only removes the package if the other is
+		// gone too. A directory with both practically never happens (Bazel
+		// would read BUILD.bazel and ignore BUILD); this exists so that
+		// repositories using either name are handled correctly, and the
+		// typical case is simply "the package's only BUILD file was
+		// deleted". If the other file is in the diff, its status decides:
+		// deleted means the package is removed; added or modified means it
+		// survives and is handled like any edited BUILD file. If it is not
+		// in the diff, it either still exists unchanged or never existed,
+		// and only the target revision can tell which.
+		otherStatus, otherInDiff := changedFiles[otherBuildFile(filePath)]
+		switch {
+		case !otherInDiff:
+			deletionsNeedingLookup[pkg] = true
+		case otherStatus == "D":
+			boundaries.removed[pkg] = true
 		}
 	}
 
-	// Second pass: map changed files to dirty packages and labels.
-	dirtyPackages := make(map[string]bool)
-	for filePath := range changedFiles {
-		base := filepath.Base(filePath)
+	if len(deletionsNeedingLookup) == 0 {
+		return boundaries, nil
+	}
+	if packagesExistAtTarget == nil {
+		return boundaryChanges{}, errNoPackageLookup
+	}
+	pkgs := sortedKeys(deletionsNeedingLookup)
+	existing, err := packagesExistAtTarget(pkgs)
+	if err != nil {
+		return boundaryChanges{}, err
+	}
+	for _, pkg := range pkgs {
+		if !existing[pkg] {
+			boundaries.removed[pkg] = true
+		}
+	}
+	return boundaries, nil
+}
 
-		var pkg string
-		if base == "BUILD" || base == "BUILD.bazel" {
-			// A BUILD file change dirties its own package (verified known above).
-			pkg = fileToPackage(filePath)
-		} else {
-			// A source file belongs to the nearest enclosing known package.
-			owner, ok := owningPackage(filePath, knownPackages)
-			if !ok {
-				// No enclosing package: the file cannot be an input to any
-				// seeded target (see function comment).
+// findDirtyPackages returns every package whose targets must be rehashed:
+// packages of changed files, the added and removed packages themselves, and
+// the nearest enclosing package of each. The result includes removed
+// packages, whose seed labels must be invalidated.
+func findDirtyPackages(
+	changedFiles map[string]string,
+	knownPackages map[string]bool,
+	boundaries boundaryChanges,
+) map[string]bool {
+	targetPackages := make(map[string]bool, len(knownPackages)+len(boundaries.added))
+	for pkg := range knownPackages {
+		if !boundaries.removed[pkg] {
+			targetPackages[pkg] = true
+		}
+	}
+	for pkg := range boundaries.added {
+		targetPackages[pkg] = true
+	}
+
+	dirty := make(map[string]bool)
+
+	// A package boundary change dirties the nearest enclosing package on both
+	// sides of the change. They differ only when several boundaries change
+	// in one diff, e.g. a package and its parent are both removed.
+	for _, changed := range []map[string]bool{boundaries.added, boundaries.removed} {
+		for pkg := range changed {
+			dirty[pkg] = true
+			if pkg == "//" {
 				continue
 			}
-			pkg = owner
-		}
-
-		if !dirtyPackages[pkg] {
-			dirtyPackages[pkg] = true
-			for _, label := range labelsByPackage[pkg] {
-				result.DirtyLabels[label] = true
+			dir := strings.TrimPrefix(pkg, "//")
+			if owner, ok := owningPackage(dir, knownPackages); ok {
+				dirty[owner] = true
+			}
+			if owner, ok := owningPackage(dir, targetPackages); ok {
+				dirty[owner] = true
 			}
 		}
 	}
 
-	for pkg := range dirtyPackages {
-		result.DirtyPackages = append(result.DirtyPackages, pkg)
-	}
-	sort.Strings(result.DirtyPackages)
-
-	// Propagate dirtiness through reverse deps.
-	rdeps := BuildRdeps(edges)
-
-	queue := make([]string, 0, len(result.DirtyLabels))
-	for label := range result.DirtyLabels {
-		result.DirtyStarLabels[label] = true
-		queue = append(queue, label)
-	}
-
-	for len(queue) > 0 {
-		current := queue[0]
-		queue = queue[1:]
-
-		for _, rdep := range rdeps[current] {
-			if !result.DirtyStarLabels[rdep] {
-				result.DirtyStarLabels[rdep] = true
-				queue = append(queue, rdep)
-			}
+	for filePath := range changedFiles {
+		if isBuildFile(filepath.Base(filePath)) {
+			// A BUILD file change dirties its own package.
+			dirty[fileToPackage(filePath)] = true
+			continue
 		}
+		// A source file belongs to the nearest enclosing known package.
+		// Ownership uses the seed's packages because that is where the
+		// file's seed labels live and must be invalidated. Where the target
+		// revision gives the file a different owner, that owner is an added
+		// package or an enclosing package of a boundary change, both
+		// already dirtied above.
+		owner, ok := owningPackage(filePath, knownPackages)
+		if !ok {
+			// No enclosing package: the file cannot be an input to any
+			// seeded target (see ComputeDirtySet).
+			continue
+		}
+		dirty[owner] = true
 	}
-
-	return result
+	return dirty
 }
 
 // ProbeResult is what a probe of the dirty packages learned about them.
@@ -201,8 +318,9 @@ type ProbeResult struct {
 // Every other label is unchanged when its probe hash matches the seed;
 // labels the probe or the seed omits are conservatively treated as changed.
 //
-// DirtyLabels and DirtyPackages are preserved — those packages still need
-// re-listing via wildcards — and only DirtyStarLabels is recomputed.
+// DirtyLabels, DirtyPackages and RemovedPackages are preserved — those
+// packages still need re-listing via wildcards or dropping — and only
+// DirtyStarLabels is recomputed.
 func PruneDirtySet(
 	original *DirtySetResult,
 	seed *PersistedHashData,
@@ -216,6 +334,7 @@ func PruneDirtySet(
 		DirtyLabels:     original.DirtyLabels,
 		DirtyStarLabels: newDirtyStar,
 		DirtyPackages:   original.DirtyPackages,
+		RemovedPackages: original.RemovedPackages,
 	}
 }
 
@@ -373,6 +492,32 @@ func isFallbackTrigger(basename string) bool {
 		return true
 	}
 	return false
+}
+
+var errNoPackageLookup = errors.New("no package lookup available")
+
+func isBuildFile(basename string) bool {
+	return basename == "BUILD" || basename == "BUILD.bazel"
+}
+
+// otherBuildFile returns the path of the other BUILD file name in the same
+// directory: "pkg/BUILD.bazel" for "pkg/BUILD", and vice versa. Bazel treats
+// either name as the package's BUILD file.
+func otherBuildFile(filePath string) string {
+	other := "BUILD"
+	if filepath.Base(filePath) == "BUILD" {
+		other = "BUILD.bazel"
+	}
+	return filepath.Join(filepath.Dir(filePath), other)
+}
+
+func sortedKeys(set map[string]bool) []string {
+	keys := make([]string, 0, len(set))
+	for key := range set {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 func fileToPackage(filePath string) string {
