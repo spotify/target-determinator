@@ -103,7 +103,9 @@ func ComputeDirtySet(
 
 	addedPackages := make(map[string]bool)
 	removedPackages := make(map[string]bool)
-	ambiguousDeletions := make(map[string]bool)
+	// Packages whose BUILD file was deleted but whose survival the diff
+	// alone cannot tell; resolved below with packagesExistAtTarget.
+	deletionsNeedingLookup := make(map[string]bool)
 
 	// First pass: fallback triggers and package boundary changes.
 	for filePath, status := range changedFiles {
@@ -142,18 +144,24 @@ func ComputeDirtySet(
 			}
 			continue
 		}
-		// The package survives a deleted BUILD file if its sibling does.
-		siblingStatus, inDiff := changedFiles[siblingBuildFile(filePath)]
+		// A directory is a package while it has a BUILD or a BUILD.bazel
+		// file, so deleting one only removes the package if the other is
+		// gone too. If the other file is in the diff, its status decides:
+		// deleted means the package is removed; added or modified means it
+		// survives and is handled like any edited BUILD file. If it is not
+		// in the diff, it either still exists unchanged or never existed,
+		// and only the target revision can tell which.
+		otherStatus, otherInDiff := changedFiles[otherBuildFile(filePath)]
 		switch {
-		case !inDiff:
-			ambiguousDeletions[pkg] = true
-		case siblingStatus == "D":
+		case !otherInDiff:
+			deletionsNeedingLookup[pkg] = true
+		case otherStatus == "D":
 			removedPackages[pkg] = true
 		}
 	}
 
-	if len(ambiguousDeletions) > 0 {
-		pkgs := sortedKeys(ambiguousDeletions)
+	if len(deletionsNeedingLookup) > 0 {
+		pkgs := sortedKeys(deletionsNeedingLookup)
 		var existing map[string]bool
 		var err error
 		if packagesExistAtTarget == nil {
@@ -470,14 +478,15 @@ func isBuildFile(basename string) bool {
 	return basename == "BUILD" || basename == "BUILD.bazel"
 }
 
-// siblingBuildFile returns the path of the other BUILD file name in the same
-// directory: Bazel treats either as the package's BUILD file.
-func siblingBuildFile(filePath string) string {
-	sibling := "BUILD"
+// otherBuildFile returns the path of the other BUILD file name in the same
+// directory: "pkg/BUILD.bazel" for "pkg/BUILD", and vice versa. Bazel treats
+// either name as the package's BUILD file.
+func otherBuildFile(filePath string) string {
+	other := "BUILD"
 	if filepath.Base(filePath) == "BUILD" {
-		sibling = "BUILD.bazel"
+		other = "BUILD.bazel"
 	}
-	return filepath.Join(filepath.Dir(filePath), sibling)
+	return filepath.Join(filepath.Dir(filePath), other)
 }
 
 func sortedKeys(set map[string]bool) []string {

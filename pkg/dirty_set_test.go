@@ -372,7 +372,7 @@ func TestComputeDirtySetDeletedPackageAndParent(t *testing.T) {
 	assertStrings(t, "lookup pkgs", lookup.calls[0], []string{"//parent", "//parent/child"})
 }
 
-func TestComputeDirtySetDeletedBUILDWithSurvivingSibling(t *testing.T) {
+func TestComputeDirtySetDeletedBUILDWithSurvivingOtherBUILD(t *testing.T) {
 	edges := boundarySeedEdges()
 	lookup := &packageLookup{existing: map[string]bool{"//gone": true}}
 	result := ComputeDirtySet(
@@ -398,7 +398,7 @@ func TestComputeDirtySetDeletionResolvedFromDiff(t *testing.T) {
 			changed:     map[string]string{"gone/BUILD": "D", "gone/BUILD.bazel": "D"},
 			wantRemoved: []string{"//gone"},
 		},
-		"sibling added": {
+		"other BUILD file added": {
 			changed:   map[string]string{"gone/BUILD.bazel": "D", "gone/BUILD": "A"},
 			wantDirty: []string{"//gone"},
 		},
