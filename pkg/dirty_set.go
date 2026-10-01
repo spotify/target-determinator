@@ -80,11 +80,68 @@ func ComputeDirtySet(
 	fallbackTriggerPatterns []string,
 	packagesExistAtTarget func(pkgs []string) (map[string]bool, error),
 ) *DirtySetResult {
-	result := &DirtySetResult{
-		DirtyLabels:     make(map[string]bool),
-		DirtyStarLabels: make(map[string]bool),
+	if code, reason, ok := findFallbackTrigger(changedFiles, ruleClassFingerprintFiles, fallbackTriggerPatterns); ok {
+		return fallbackResult(code, reason)
 	}
 
+	knownPackages, labelsByPackage := indexSeedPackages(allLabels)
+	boundaries, err := findBoundaryChanges(changedFiles, knownPackages, packagesExistAtTarget)
+	if err != nil {
+		return fallbackResult("package_lookup_error",
+			"cannot determine whether deleted packages still exist: "+err.Error())
+	}
+
+	result := &DirtySetResult{DirtyLabels: make(map[string]bool)}
+	for pkg := range findDirtyPackages(changedFiles, knownPackages, boundaries) {
+		for _, label := range labelsByPackage[pkg] {
+			result.DirtyLabels[label] = true
+		}
+		if !boundaries.removed[pkg] {
+			result.DirtyPackages = append(result.DirtyPackages, pkg)
+		}
+	}
+	sort.Strings(result.DirtyPackages)
+	result.RemovedPackages = sortedKeys(boundaries.removed)
+	result.DirtyStarLabels = propagateFrom(result.DirtyLabels, result.DirtyLabels, edges)
+	return result
+}
+
+func fallbackResult(code, reason string) *DirtySetResult {
+	return &DirtySetResult{
+		DirtyLabels:     make(map[string]bool),
+		DirtyStarLabels: make(map[string]bool),
+		NeedsFallback:   true,
+		FallbackCode:    code,
+		FallbackReason:  reason,
+	}
+}
+
+// findFallbackTrigger reports the first changed file that forces a full
+// rehash, with its fallback code and reason.
+func findFallbackTrigger(
+	changedFiles map[string]string,
+	ruleClassFingerprintFiles map[string]bool,
+	fallbackTriggerPatterns []string,
+) (code, reason string, found bool) {
+	for filePath := range changedFiles {
+		if ruleClassFingerprintFiles[filePath] {
+			return "rule_fingerprint_change", "rule-class fingerprint file changed: " + filePath, true
+		}
+		for _, pattern := range fallbackTriggerPatterns {
+			if matched, _ := path.Match(pattern, filePath); matched {
+				return "unsafe_file_change", "file matched fallback trigger pattern " + pattern + ": " + filePath, true
+			}
+		}
+		if isFallbackTrigger(filepath.Base(filePath)) {
+			return "unsafe_file_change", "fallback trigger file changed: " + filePath, true
+		}
+	}
+	return "", "", false
+}
+
+// indexSeedPackages returns the main-workspace packages known to the seed and
+// their labels.
+func indexSeedPackages(allLabels map[string]bool) (map[string]bool, map[string][]string) {
 	knownPackages := make(map[string]bool)
 	labelsByPackage := make(map[string][]string)
 	for label := range allLabels {
@@ -100,47 +157,37 @@ func ComputeDirtySet(
 		knownPackages[pkg] = true
 		labelsByPackage[pkg] = append(labelsByPackage[pkg], label)
 	}
+	return knownPackages, labelsByPackage
+}
 
-	addedPackages := make(map[string]bool)
-	removedPackages := make(map[string]bool)
+// boundaryChanges are the packages that appear or disappear between the seed
+// and the target revision.
+type boundaryChanges struct {
+	added   map[string]bool
+	removed map[string]bool
+}
+
+// findBoundaryChanges classifies changed BUILD files into added and removed
+// packages. It returns an error only when packagesExistAtTarget is needed and
+// is nil or fails.
+func findBoundaryChanges(
+	changedFiles map[string]string,
+	knownPackages map[string]bool,
+	packagesExistAtTarget func(pkgs []string) (map[string]bool, error),
+) (boundaryChanges, error) {
+	boundaries := boundaryChanges{added: make(map[string]bool), removed: make(map[string]bool)}
 	// Packages whose BUILD file was deleted but whose survival the diff
 	// alone cannot tell; resolved below with packagesExistAtTarget.
 	deletionsNeedingLookup := make(map[string]bool)
 
-	// First pass: fallback triggers and package boundary changes.
 	for filePath, status := range changedFiles {
-		base := filepath.Base(filePath)
-
-		if ruleClassFingerprintFiles[filePath] {
-			result.NeedsFallback = true
-			result.FallbackCode = "rule_fingerprint_change"
-			result.FallbackReason = "rule-class fingerprint file changed: " + filePath
-			return result
-		}
-
-		for _, pattern := range fallbackTriggerPatterns {
-			if matched, _ := path.Match(pattern, filePath); matched {
-				result.NeedsFallback = true
-				result.FallbackCode = "unsafe_file_change"
-				result.FallbackReason = "file matched fallback trigger pattern " + pattern + ": " + filePath
-				return result
-			}
-		}
-
-		if isFallbackTrigger(base) {
-			result.NeedsFallback = true
-			result.FallbackCode = "unsafe_file_change"
-			result.FallbackReason = "fallback trigger file changed: " + filePath
-			return result
-		}
-
-		if !isBuildFile(base) {
+		if !isBuildFile(filepath.Base(filePath)) {
 			continue
 		}
 		pkg := fileToPackage(filePath)
 		if status != "D" {
 			if !knownPackages[pkg] {
-				addedPackages[pkg] = true
+				boundaries.added[pkg] = true
 			}
 			continue
 		}
@@ -160,124 +207,83 @@ func ComputeDirtySet(
 		case !otherInDiff:
 			deletionsNeedingLookup[pkg] = true
 		case otherStatus == "D":
-			removedPackages[pkg] = true
+			boundaries.removed[pkg] = true
 		}
 	}
 
-	if len(deletionsNeedingLookup) > 0 {
-		pkgs := sortedKeys(deletionsNeedingLookup)
-		var existing map[string]bool
-		var err error
-		if packagesExistAtTarget == nil {
-			err = errNoPackageLookup
-		} else {
-			existing, err = packagesExistAtTarget(pkgs)
-		}
-		if err != nil {
-			result.NeedsFallback = true
-			result.FallbackCode = "package_boundary_change"
-			result.FallbackReason = "cannot determine whether deleted packages still exist: " + err.Error()
-			return result
-		}
-		for _, pkg := range pkgs {
-			if !existing[pkg] {
-				removedPackages[pkg] = true
-			}
+	if len(deletionsNeedingLookup) == 0 {
+		return boundaries, nil
+	}
+	if packagesExistAtTarget == nil {
+		return boundaryChanges{}, errNoPackageLookup
+	}
+	pkgs := sortedKeys(deletionsNeedingLookup)
+	existing, err := packagesExistAtTarget(pkgs)
+	if err != nil {
+		return boundaryChanges{}, err
+	}
+	for _, pkg := range pkgs {
+		if !existing[pkg] {
+			boundaries.removed[pkg] = true
 		}
 	}
+	return boundaries, nil
+}
 
-	targetPackages := make(map[string]bool, len(knownPackages)+len(addedPackages))
+// findDirtyPackages returns every package whose targets must be rehashed:
+// packages of changed files, the added and removed packages themselves, and
+// the nearest enclosing package of each. The result includes removed
+// packages, whose seed labels must be invalidated.
+func findDirtyPackages(
+	changedFiles map[string]string,
+	knownPackages map[string]bool,
+	boundaries boundaryChanges,
+) map[string]bool {
+	targetPackages := make(map[string]bool, len(knownPackages)+len(boundaries.added))
 	for pkg := range knownPackages {
-		if !removedPackages[pkg] {
+		if !boundaries.removed[pkg] {
 			targetPackages[pkg] = true
 		}
 	}
-	for pkg := range addedPackages {
+	for pkg := range boundaries.added {
 		targetPackages[pkg] = true
 	}
 
-	// Second pass: map changed files to dirty packages and labels.
-	dirtyPackages := make(map[string]bool)
-	markDirty := func(pkg string) {
-		if dirtyPackages[pkg] {
-			return
-		}
-		dirtyPackages[pkg] = true
-		for _, label := range labelsByPackage[pkg] {
-			result.DirtyLabels[label] = true
-		}
-	}
+	dirty := make(map[string]bool)
 
 	// A package boundary change dirties the nearest enclosing package on both
 	// sides of the change. They differ only when several boundaries change
 	// in one diff, e.g. a package and its parent are both removed.
-	for _, boundaries := range []map[string]bool{addedPackages, removedPackages} {
-		for pkg := range boundaries {
-			markDirty(pkg)
+	for _, changed := range []map[string]bool{boundaries.added, boundaries.removed} {
+		for pkg := range changed {
+			dirty[pkg] = true
 			if pkg == "//" {
 				continue
 			}
 			dir := strings.TrimPrefix(pkg, "//")
 			if owner, ok := owningPackage(dir, knownPackages); ok {
-				markDirty(owner)
+				dirty[owner] = true
 			}
 			if owner, ok := owningPackage(dir, targetPackages); ok {
-				markDirty(owner)
+				dirty[owner] = true
 			}
 		}
 	}
 
 	for filePath := range changedFiles {
-		base := filepath.Base(filePath)
-
-		var pkg string
-		if isBuildFile(base) {
+		if isBuildFile(filepath.Base(filePath)) {
 			// A BUILD file change dirties its own package.
-			pkg = fileToPackage(filePath)
-		} else {
-			// A source file belongs to the nearest enclosing known package.
-			owner, ok := owningPackage(filePath, knownPackages)
-			if !ok {
-				// No enclosing package: the file cannot be an input to any
-				// seeded target (see function comment).
-				continue
-			}
-			pkg = owner
+			dirty[fileToPackage(filePath)] = true
+			continue
 		}
-
-		markDirty(pkg)
-	}
-
-	for pkg := range dirtyPackages {
-		if !removedPackages[pkg] {
-			result.DirtyPackages = append(result.DirtyPackages, pkg)
+		// A source file belongs to the nearest enclosing known package. With
+		// none, it cannot be an input to any seeded target (see
+		// ComputeDirtySet).
+		if owner, ok := owningPackage(filePath, knownPackages); ok {
+			dirty[owner] = true
 		}
 	}
-	sort.Strings(result.DirtyPackages)
-	result.RemovedPackages = sortedKeys(removedPackages)
-
-	// Propagate dirtiness through reverse deps.
-	rdeps := BuildRdeps(edges)
-
-	queue := make([]string, 0, len(result.DirtyLabels))
-	for label := range result.DirtyLabels {
-		result.DirtyStarLabels[label] = true
-		queue = append(queue, label)
-	}
-
-	for len(queue) > 0 {
-		current := queue[0]
-		queue = queue[1:]
-
-		for _, rdep := range rdeps[current] {
-			if !result.DirtyStarLabels[rdep] {
-				result.DirtyStarLabels[rdep] = true
-				queue = append(queue, rdep)
-			}
-		}
-	}
-
-	return result
+	return dirty
 }
 
 // ProbeResult is what a probe of the dirty packages learned about them.

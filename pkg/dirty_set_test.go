@@ -446,8 +446,8 @@ func TestComputeDirtySetDeletionLookupFailureFallsBack(t *testing.T) {
 			if !result.NeedsFallback {
 				t.Fatal("expected fallback when deleted package existence is unknown")
 			}
-			if result.FallbackCode != "package_boundary_change" {
-				t.Errorf("FallbackCode = %q, want package_boundary_change", result.FallbackCode)
+			if result.FallbackCode != "package_lookup_error" {
+				t.Errorf("FallbackCode = %q, want package_lookup_error", result.FallbackCode)
 			}
 		})
 	}
