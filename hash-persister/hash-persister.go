@@ -13,6 +13,7 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"strings"
 	"time"
@@ -258,7 +259,10 @@ func runSeeded(cfg *config) (seededOutcome, error) {
 
 	phaseStart = time.Now()
 	allLabels := pkg.CollectAllLabels(seedData.TargetEdges, seedData.TargetHashes)
-	dirtyResult := pkg.ComputeDirtySet(changedFiles, seedData.TargetEdges, allLabels, fingerprintFiles, cfg.FallbackTriggerPatterns)
+	packagesExistAtTarget := func(pkgs []string) (map[string]bool, error) {
+		return gitPackagesExist(cfg.Context.WorkspacePath, cfg.CommitSha, pkgs)
+	}
+	dirtyResult := pkg.ComputeDirtySet(changedFiles, seedData.TargetEdges, allLabels, fingerprintFiles, cfg.FallbackTriggerPatterns, packagesExistAtTarget)
 	outcome.DirtyPackageCount = len(dirtyResult.DirtyPackages)
 	outcome.DirtyTargetCount = len(dirtyResult.DirtyStarLabels)
 	log.Printf("Dirty set computed in %v: %d dirty, %d dirty*, %d dirty packages (fallback=%v)",
@@ -341,24 +345,7 @@ func runSeeded(cfg *config) (seededOutcome, error) {
 	// The scoped universe re-lists every dirty package with a wildcard (to
 	// pick up added and deleted targets) and names the rdeps-propagated
 	// targets in unchanged packages explicitly.
-	carriedLabels := make([]string, 0, len(dirtyResult.DirtyStarLabels))
-	dirtyPackageSet := make(map[string]bool, len(dirtyResult.DirtyPackages))
-	for _, p := range dirtyResult.DirtyPackages {
-		dirtyPackageSet[p] = true
-	}
-	for label := range dirtyResult.DirtyStarLabels {
-		// Only carry labels that were matching targets in the seed: labels
-		// that only appear as dependency edges (source files, external or
-		// manual targets) are not part of the persisted target set.
-		if _, ok := seedData.TargetHashes[label]; !ok {
-			continue
-		}
-		if dirtyPackageSet[pkg.LabelPackage(label)] {
-			continue
-		}
-		carriedLabels = append(carriedLabels, label)
-	}
-
+	carriedLabels := carriedScopedLabels(dirtyResult, seedData.TargetHashes)
 	universe := pkg.BuildScopedUniverse(dirtyResult.DirtyPackages, carriedLabels)
 	scopedPattern, err := pkg.ScopeTargetsPattern(cfg.Targets.String(), universe)
 	if err != nil {
@@ -422,6 +409,34 @@ func runSeeded(cfg *config) (seededOutcome, error) {
 	outcome.TotalTargetCount = len(persistedData.TargetHashes)
 	outcome.ReusedTargetCount = outcome.TotalTargetCount - outcome.RecomputedTargetCount
 	return outcome, nil
+}
+
+// carriedScopedLabels returns the dirty* labels that must be named explicitly
+// in the scoped universe: seeded matching targets outside the dirty packages,
+// which are already re-listed by wildcard, and outside removed packages,
+// whose targets no longer exist.
+func carriedScopedLabels(dirtyResult *pkg.DirtySetResult, seedTargetHashes map[string]map[string]string) []string {
+	skipPackages := make(map[string]bool, len(dirtyResult.DirtyPackages)+len(dirtyResult.RemovedPackages))
+	for _, p := range dirtyResult.DirtyPackages {
+		skipPackages[p] = true
+	}
+	for _, p := range dirtyResult.RemovedPackages {
+		skipPackages[p] = true
+	}
+	carried := make([]string, 0, len(dirtyResult.DirtyStarLabels))
+	for label := range dirtyResult.DirtyStarLabels {
+		// Only carry labels that were matching targets in the seed: labels
+		// that only appear as dependency edges (source files, external or
+		// manual targets) are not part of the persisted target set.
+		if _, ok := seedTargetHashes[label]; !ok {
+			continue
+		}
+		if skipPackages[pkg.LabelPackage(label)] {
+			continue
+		}
+		carried = append(carried, label)
+	}
+	return carried
 }
 
 // probePruneDirtySet runs a small probe query on just the dirty packages,
@@ -878,6 +893,41 @@ func gitDiffNameStatus(workingDirectory, fromSha, toSha string) (map[string]stri
 	}
 
 	return parseGitNameStatus(stdout.Bytes())
+}
+
+// gitPackagesExist reports which of the given packages ("//a/b", or "//" for
+// the root) have a BUILD or BUILD.bazel file at sha. All packages are looked
+// up in a single path-limited, non-recursive git ls-tree.
+func gitPackagesExist(workingDirectory, sha string, pkgs []string) (map[string]bool, error) {
+	args := []string{"ls-tree", "-z", "--name-only", sha, "--"}
+	for _, p := range pkgs {
+		dir := strings.TrimPrefix(p, "//")
+		for _, name := range []string{"BUILD", "BUILD.bazel"} {
+			args = append(args, path.Join(dir, name))
+		}
+	}
+	gitCmd := exec.Command("git", args...)
+	gitCmd.Dir = workingDirectory
+	var stdout, stderr bytes.Buffer
+	gitCmd.Stdout = &stdout
+	gitCmd.Stderr = &stderr
+	if err := gitCmd.Run(); err != nil {
+		return nil, fmt.Errorf("git ls-tree %s failed: %w. Stderr: %s", sha, err, stderr.String())
+	}
+
+	existing := make(map[string]bool, len(pkgs))
+	for _, entry := range bytes.Split(stdout.Bytes(), []byte{0}) {
+		if len(entry) == 0 {
+			continue
+		}
+		dir := path.Dir(string(entry))
+		if dir == "." {
+			existing["//"] = true
+		} else {
+			existing["//"+dir] = true
+		}
+	}
+	return existing, nil
 }
 
 func parseGitNameStatus(output []byte) (map[string]string, error) {

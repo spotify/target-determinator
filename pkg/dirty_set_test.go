@@ -1,6 +1,7 @@
 package pkg
 
 import (
+	"errors"
 	"sort"
 	"testing"
 )
@@ -16,7 +17,7 @@ func TestComputeDirtySetSourceFileChange(t *testing.T) {
 		"pkg/src.java": "M",
 	}
 
-	result := ComputeDirtySet(changedFiles, edges, allLabels, nil, nil)
+	result := ComputeDirtySet(changedFiles, edges, allLabels, nil, nil, nil)
 
 	if result.NeedsFallback {
 		t.Fatal("unexpected fallback")
@@ -44,7 +45,7 @@ func TestComputeDirtySetBUILDFileChange(t *testing.T) {
 		"pkg/BUILD.bazel": "M",
 	}
 
-	result := ComputeDirtySet(changedFiles, edges, allLabels, nil, nil)
+	result := ComputeDirtySet(changedFiles, edges, allLabels, nil, nil, nil)
 
 	if result.NeedsFallback {
 		t.Fatal("unexpected fallback")
@@ -74,7 +75,7 @@ func TestComputeDirtySetMainRootDoesNotDirtyExternalRootLabels(t *testing.T) {
 	allLabels := CollectAllLabels(edges, nil)
 
 	result := ComputeDirtySet(
-		map[string]string{"root.txt": "M"}, edges, allLabels, nil, nil,
+		map[string]string{"root.txt": "M"}, edges, allLabels, nil, nil, nil,
 	)
 
 	if !result.DirtyLabels["//:main"] {
@@ -100,7 +101,7 @@ func TestComputeDirtySetMainPackageDoesNotDirtyExternalPackageLabels(t *testing.
 	allLabels := CollectAllLabels(edges, nil)
 
 	result := ComputeDirtySet(
-		map[string]string{"shared/source.txt": "M"}, edges, allLabels, nil, nil,
+		map[string]string{"shared/source.txt": "M"}, edges, allLabels, nil, nil, nil,
 	)
 
 	if !result.DirtyLabels["//shared:main"] {
@@ -126,7 +127,7 @@ func TestComputeDirtySetPropagatesThroughExternalLabels(t *testing.T) {
 	allLabels := CollectAllLabels(edges, nil)
 
 	result := ComputeDirtySet(
-		map[string]string{"pkg/source.txt": "M"}, edges, allLabels, nil, nil,
+		map[string]string{"pkg/source.txt": "M"}, edges, allLabels, nil, nil, nil,
 	)
 
 	for _, label := range []string{
@@ -154,7 +155,7 @@ func TestComputeDirtySetBzlFallback(t *testing.T) {
 		"tools/defs.bzl": "M",
 	}
 
-	result := ComputeDirtySet(changedFiles, edges, allLabels, nil, nil)
+	result := ComputeDirtySet(changedFiles, edges, allLabels, nil, nil, nil)
 
 	if !result.NeedsFallback {
 		t.Fatal("expected fallback for .bzl change")
@@ -172,7 +173,7 @@ func TestComputeDirtySetModuleBazelFallback(t *testing.T) {
 		"MODULE.bazel": "M",
 	}
 
-	result := ComputeDirtySet(changedFiles, nil, nil, nil, nil)
+	result := ComputeDirtySet(changedFiles, nil, nil, nil, nil, nil)
 
 	if !result.NeedsFallback {
 		t.Fatal("expected fallback for MODULE.bazel change")
@@ -184,67 +185,317 @@ func TestComputeDirtySetSubModuleBazelFallback(t *testing.T) {
 		"tools/modules/rules_java.MODULE.bazel": "M",
 	}
 
-	result := ComputeDirtySet(changedFiles, nil, nil, nil, nil)
+	result := ComputeDirtySet(changedFiles, nil, nil, nil, nil, nil)
 
 	if !result.NeedsFallback {
 		t.Fatal("expected fallback for *.MODULE.bazel change")
 	}
 }
 
-func TestComputeDirtySetDeletedBUILDFallsBack(t *testing.T) {
-	edges := map[string][]string{
-		"//deleted_pkg:target": {"//lib:dep"},
-		"//app:binary":         {"//deleted_pkg:target"},
-		"//lib:dep":            {},
-	}
-	allLabels := CollectAllLabels(edges, nil)
-
-	changedFiles := map[string]string{
-		"deleted_pkg/BUILD.bazel": "D",
-	}
-
-	result := ComputeDirtySet(changedFiles, edges, allLabels, nil, nil)
-
-	if !result.NeedsFallback {
-		t.Fatal("expected fallback for deleted BUILD file")
-	}
-	if result.FallbackCode != "package_boundary_change" {
-		t.Errorf("FallbackCode = %q, want package_boundary_change", result.FallbackCode)
+// boundarySeedEdges is a seed in which //parent:lib globs over parent/child,
+// before child becomes a package of its own.
+func boundarySeedEdges() map[string][]string {
+	return map[string][]string{
+		"//parent:lib":  {"//parent:a.java", "//parent:child/b.java"},
+		"//app:bin":     {"//parent:lib"},
+		"//gone:target": {"//other:x"},
+		"//app:user":    {"//gone:target"},
+		"//other:x":     {},
 	}
 }
 
-func TestComputeDirtySetRenamedBUILDFallsBack(t *testing.T) {
-	edges := map[string][]string{
-		"//pkg:target": {},
+// packageLookup is a stub packagesExistAtTarget that records its calls.
+type packageLookup struct {
+	existing map[string]bool
+	err      error
+	calls    [][]string
+}
+
+func (l *packageLookup) lookup(pkgs []string) (map[string]bool, error) {
+	l.calls = append(l.calls, pkgs)
+	return l.existing, l.err
+}
+
+func assertStrings(t *testing.T, name string, got, want []string) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Fatalf("%s = %v, want %v", name, got, want)
 	}
-	allLabels := CollectAllLabels(edges, nil)
-
-	changedFiles := map[string]string{
-		"pkg/BUILD.bazel": "R100",
-	}
-
-	result := ComputeDirtySet(changedFiles, edges, allLabels, nil, nil)
-
-	if !result.NeedsFallback {
-		t.Fatal("expected fallback for renamed BUILD file")
+	for i := range got {
+		if got[i] != want[i] {
+			t.Fatalf("%s = %v, want %v", name, got, want)
+		}
 	}
 }
 
-func TestComputeDirtySetNewPackageFallsBack(t *testing.T) {
-	edges := map[string][]string{
-		"//pkg:target": {},
-	}
-	allLabels := CollectAllLabels(edges, nil)
+func TestComputeDirtySetNewPackageDirtiesEnclosingPackage(t *testing.T) {
+	edges := boundarySeedEdges()
+	result := ComputeDirtySet(
+		map[string]string{"parent/child/BUILD.bazel": "A", "parent/child/c.java": "A"},
+		edges, CollectAllLabels(edges, nil), nil, nil, nil,
+	)
 
-	changedFiles := map[string]string{
-		"newpkg/BUILD.bazel": "A",
+	if result.NeedsFallback {
+		t.Fatalf("unexpected fallback: %s", result.FallbackReason)
 	}
-
-	result := ComputeDirtySet(changedFiles, edges, allLabels, nil, nil)
-
-	if !result.NeedsFallback {
-		t.Fatal("expected fallback for BUILD file of package unknown to seed")
+	assertStrings(t, "DirtyPackages", result.DirtyPackages, []string{"//parent", "//parent/child"})
+	assertStrings(t, "RemovedPackages", result.RemovedPackages, nil)
+	for _, label := range []string{"//parent:lib", "//parent:child/b.java"} {
+		if !result.DirtyLabels[label] {
+			t.Errorf("expected %s dirty", label)
+		}
 	}
+	if !result.DirtyStarLabels["//app:bin"] {
+		t.Error("expected rdep //app:bin of the enclosing package dirty*")
+	}
+	if result.DirtyStarLabels["//app:user"] {
+		t.Error("//app:user is unrelated and should not be dirty*")
+	}
+}
+
+func TestComputeDirtySetNewPackageWithoutKnownAncestor(t *testing.T) {
+	edges := boundarySeedEdges()
+	result := ComputeDirtySet(
+		map[string]string{"brand/new/BUILD.bazel": "A"},
+		edges, CollectAllLabels(edges, nil), nil, nil, nil,
+	)
+
+	if result.NeedsFallback {
+		t.Fatalf("unexpected fallback: %s", result.FallbackReason)
+	}
+	assertStrings(t, "DirtyPackages", result.DirtyPackages, []string{"//brand/new"})
+	if len(result.DirtyLabels) != 0 {
+		t.Errorf("DirtyLabels = %v, want none", result.DirtyLabels)
+	}
+}
+
+func TestComputeDirtySetNewRootPackage(t *testing.T) {
+	edges := boundarySeedEdges()
+	result := ComputeDirtySet(
+		map[string]string{"BUILD.bazel": "A"},
+		edges, CollectAllLabels(edges, nil), nil, nil, nil,
+	)
+
+	if result.NeedsFallback {
+		t.Fatalf("unexpected fallback: %s", result.FallbackReason)
+	}
+	assertStrings(t, "DirtyPackages", result.DirtyPackages, []string{"//"})
+}
+
+func TestComputeDirtySetNestedNewPackages(t *testing.T) {
+	edges := boundarySeedEdges()
+	result := ComputeDirtySet(
+		map[string]string{
+			"parent/child/BUILD.bazel":      "A",
+			"parent/child/deep/BUILD.bazel": "A",
+		},
+		edges, CollectAllLabels(edges, nil), nil, nil, nil,
+	)
+
+	if result.NeedsFallback {
+		t.Fatalf("unexpected fallback: %s", result.FallbackReason)
+	}
+	assertStrings(t, "DirtyPackages", result.DirtyPackages,
+		[]string{"//parent", "//parent/child", "//parent/child/deep"})
+}
+
+func TestComputeDirtySetDeletedPackage(t *testing.T) {
+	edges := boundarySeedEdges()
+	edges["//gone:target"] = []string{"//other:x", "//gone:src.java"}
+	lookup := &packageLookup{existing: map[string]bool{}}
+	result := ComputeDirtySet(
+		map[string]string{"gone/BUILD.bazel": "D"},
+		edges, CollectAllLabels(edges, nil), nil, nil, lookup.lookup,
+	)
+
+	if result.NeedsFallback {
+		t.Fatalf("unexpected fallback: %s", result.FallbackReason)
+	}
+	assertStrings(t, "RemovedPackages", result.RemovedPackages, []string{"//gone"})
+	assertStrings(t, "DirtyPackages", result.DirtyPackages, nil)
+	for _, label := range []string{"//gone:target", "//gone:src.java"} {
+		if !result.DirtyLabels[label] {
+			t.Errorf("expected removed label %s dirty", label)
+		}
+	}
+	if !result.DirtyStarLabels["//app:user"] {
+		t.Error("expected rdep //app:user of the removed package dirty*")
+	}
+	if len(lookup.calls) != 1 {
+		t.Fatalf("lookup called %d times, want 1", len(lookup.calls))
+	}
+	assertStrings(t, "lookup pkgs", lookup.calls[0], []string{"//gone"})
+}
+
+func TestComputeDirtySetDeletedPackageDirtiesNewOwner(t *testing.T) {
+	edges := boundarySeedEdges()
+	edges["//parent/child:lib"] = []string{"//parent/child:b.java"}
+	lookup := &packageLookup{existing: map[string]bool{}}
+	result := ComputeDirtySet(
+		map[string]string{"parent/child/BUILD.bazel": "D"},
+		edges, CollectAllLabels(edges, nil), nil, nil, lookup.lookup,
+	)
+
+	if result.NeedsFallback {
+		t.Fatalf("unexpected fallback: %s", result.FallbackReason)
+	}
+	assertStrings(t, "RemovedPackages", result.RemovedPackages, []string{"//parent/child"})
+	assertStrings(t, "DirtyPackages", result.DirtyPackages, []string{"//parent"})
+	if !result.DirtyLabels["//parent:lib"] {
+		t.Error("expected the absorbing package's //parent:lib dirty")
+	}
+}
+
+func TestComputeDirtySetDeletedPackageAndParent(t *testing.T) {
+	// Seed owner of //parent/child is //parent, but //parent is removed too,
+	// so at the target its files belong to the root package.
+	edges := boundarySeedEdges()
+	edges["//parent/child:lib"] = []string{}
+	edges["//:root"] = []string{}
+	lookup := &packageLookup{existing: map[string]bool{}}
+	result := ComputeDirtySet(
+		map[string]string{
+			"parent/BUILD.bazel":       "D",
+			"parent/child/BUILD.bazel": "D",
+		},
+		edges, CollectAllLabels(edges, nil), nil, nil, lookup.lookup,
+	)
+
+	if result.NeedsFallback {
+		t.Fatalf("unexpected fallback: %s", result.FallbackReason)
+	}
+	assertStrings(t, "RemovedPackages", result.RemovedPackages, []string{"//parent", "//parent/child"})
+	assertStrings(t, "DirtyPackages", result.DirtyPackages, []string{"//"})
+	if len(lookup.calls) != 1 {
+		t.Fatalf("lookup called %d times, want 1 batched call", len(lookup.calls))
+	}
+	assertStrings(t, "lookup pkgs", lookup.calls[0], []string{"//parent", "//parent/child"})
+}
+
+func TestComputeDirtySetDeletedBUILDWithSurvivingSibling(t *testing.T) {
+	edges := boundarySeedEdges()
+	lookup := &packageLookup{existing: map[string]bool{"//gone": true}}
+	result := ComputeDirtySet(
+		map[string]string{"gone/BUILD.bazel": "D"},
+		edges, CollectAllLabels(edges, nil), nil, nil, lookup.lookup,
+	)
+
+	if result.NeedsFallback {
+		t.Fatalf("unexpected fallback: %s", result.FallbackReason)
+	}
+	assertStrings(t, "RemovedPackages", result.RemovedPackages, nil)
+	assertStrings(t, "DirtyPackages", result.DirtyPackages, []string{"//gone"})
+}
+
+func TestComputeDirtySetDeletionResolvedFromDiff(t *testing.T) {
+	edges := boundarySeedEdges()
+	cases := map[string]struct {
+		changed     map[string]string
+		wantRemoved []string
+		wantDirty   []string
+	}{
+		"both BUILD files deleted": {
+			changed:     map[string]string{"gone/BUILD": "D", "gone/BUILD.bazel": "D"},
+			wantRemoved: []string{"//gone"},
+		},
+		"sibling added": {
+			changed:   map[string]string{"gone/BUILD.bazel": "D", "gone/BUILD": "A"},
+			wantDirty: []string{"//gone"},
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			lookup := &packageLookup{}
+			result := ComputeDirtySet(tc.changed, edges, CollectAllLabels(edges, nil), nil, nil, lookup.lookup)
+
+			if result.NeedsFallback {
+				t.Fatalf("unexpected fallback: %s", result.FallbackReason)
+			}
+			if len(lookup.calls) != 0 {
+				t.Errorf("lookup called %d times, want 0", len(lookup.calls))
+			}
+			assertStrings(t, "RemovedPackages", result.RemovedPackages, tc.wantRemoved)
+			assertStrings(t, "DirtyPackages", result.DirtyPackages, tc.wantDirty)
+		})
+	}
+}
+
+func TestComputeDirtySetNoLookupWithoutDeletions(t *testing.T) {
+	edges := boundarySeedEdges()
+	lookup := &packageLookup{}
+	ComputeDirtySet(
+		map[string]string{"parent/BUILD.bazel": "M", "brand/new/BUILD.bazel": "A"},
+		edges, CollectAllLabels(edges, nil), nil, nil, lookup.lookup,
+	)
+	if len(lookup.calls) != 0 {
+		t.Errorf("lookup called %d times, want 0", len(lookup.calls))
+	}
+}
+
+func TestComputeDirtySetDeletionLookupFailureFallsBack(t *testing.T) {
+	edges := boundarySeedEdges()
+	for name, lookup := range map[string]func([]string) (map[string]bool, error){
+		"nil lookup":    nil,
+		"lookup errors": (&packageLookup{err: errors.New("boom")}).lookup,
+	} {
+		t.Run(name, func(t *testing.T) {
+			result := ComputeDirtySet(
+				map[string]string{"gone/BUILD.bazel": "D"},
+				edges, CollectAllLabels(edges, nil), nil, nil, lookup,
+			)
+			if !result.NeedsFallback {
+				t.Fatal("expected fallback when deleted package existence is unknown")
+			}
+			if result.FallbackCode != "package_boundary_change" {
+				t.Errorf("FallbackCode = %q, want package_boundary_change", result.FallbackCode)
+			}
+		})
+	}
+}
+
+func TestComputeDirtySetPackageMove(t *testing.T) {
+	edges := boundarySeedEdges()
+	lookup := &packageLookup{existing: map[string]bool{}}
+	result := ComputeDirtySet(
+		map[string]string{
+			"gone/BUILD.bazel":         "D",
+			"gone/src.java":            "D",
+			"parent/moved/BUILD.bazel": "A",
+			"parent/moved/src.java":    "A",
+		},
+		edges, CollectAllLabels(edges, nil), nil, nil, lookup.lookup,
+	)
+
+	if result.NeedsFallback {
+		t.Fatalf("unexpected fallback: %s", result.FallbackReason)
+	}
+	assertStrings(t, "RemovedPackages", result.RemovedPackages, []string{"//gone"})
+	assertStrings(t, "DirtyPackages", result.DirtyPackages, []string{"//parent", "//parent/moved"})
+	if !result.DirtyStarLabels["//app:user"] {
+		t.Error("expected rdep of the removed package dirty*")
+	}
+}
+
+func TestComputeDirtySetBoundaryChangeWithBzlStillFallsBack(t *testing.T) {
+	edges := boundarySeedEdges()
+	result := ComputeDirtySet(
+		map[string]string{"parent/child/BUILD.bazel": "A", "tools/defs.bzl": "M"},
+		edges, CollectAllLabels(edges, nil), nil, nil, nil,
+	)
+	if !result.NeedsFallback || result.FallbackCode != "unsafe_file_change" {
+		t.Errorf("got fallback=%v code=%q, want unsafe_file_change", result.NeedsFallback, result.FallbackCode)
+	}
+}
+
+func TestPruneDirtySetPreservesRemovedPackages(t *testing.T) {
+	edges := boundarySeedEdges()
+	lookup := &packageLookup{existing: map[string]bool{}}
+	original := ComputeDirtySet(
+		map[string]string{"gone/BUILD.bazel": "D"},
+		edges, CollectAllLabels(edges, nil), nil, nil, lookup.lookup,
+	)
+	pruned := PruneDirtySet(original, &PersistedHashData{TargetEdges: edges}, ProbeResult{}, nil)
+	assertStrings(t, "RemovedPackages", pruned.RemovedPackages, []string{"//gone"})
 }
 
 func TestComputeDirtySetOwningPackageWalkUp(t *testing.T) {
@@ -260,7 +511,7 @@ func TestComputeDirtySetOwningPackageWalkUp(t *testing.T) {
 		"svc/src/main/java/App.java": "M",
 	}
 
-	result := ComputeDirtySet(changedFiles, edges, allLabels, nil, nil)
+	result := ComputeDirtySet(changedFiles, edges, allLabels, nil, nil, nil)
 
 	if result.NeedsFallback {
 		t.Fatalf("unexpected fallback: %s", result.FallbackReason)
@@ -286,7 +537,7 @@ func TestComputeDirtySetUnownedFileIgnored(t *testing.T) {
 		"docs/README.md": "M",
 	}
 
-	result := ComputeDirtySet(changedFiles, edges, allLabels, nil, nil)
+	result := ComputeDirtySet(changedFiles, edges, allLabels, nil, nil, nil)
 
 	if result.NeedsFallback {
 		t.Fatalf("unexpected fallback: %s", result.FallbackReason)
@@ -313,7 +564,7 @@ func TestComputeDirtySetDiamondRdeps(t *testing.T) {
 		"pkg/d.java": "M",
 	}
 
-	result := ComputeDirtySet(changedFiles, edges, allLabels, nil, nil)
+	result := ComputeDirtySet(changedFiles, edges, allLabels, nil, nil, nil)
 
 	for _, label := range []string{"//pkg:A", "//pkg:B", "//pkg:C", "//pkg:D", "//pkg:d.java"} {
 		if !result.DirtyStarLabels[label] {
@@ -331,7 +582,7 @@ func TestComputeDirtySetFingerprintFileFallback(t *testing.T) {
 		"tools/modules/rules_java.MODULE.bazel": "M",
 	}
 
-	result := ComputeDirtySet(changedFiles, nil, nil, fingerprints, nil)
+	result := ComputeDirtySet(changedFiles, nil, nil, fingerprints, nil, nil)
 
 	if !result.NeedsFallback {
 		t.Fatal("expected fallback for fingerprint file change")
@@ -340,7 +591,7 @@ func TestComputeDirtySetFingerprintFileFallback(t *testing.T) {
 
 func TestComputeDirtySetBazelrcFallback(t *testing.T) {
 	changedFiles := map[string]string{".bazelrc": "M"}
-	result := ComputeDirtySet(changedFiles, nil, nil, nil, nil)
+	result := ComputeDirtySet(changedFiles, nil, nil, nil, nil, nil)
 	if !result.NeedsFallback {
 		t.Fatal("expected fallback for .bazelrc change")
 	}
@@ -348,7 +599,7 @@ func TestComputeDirtySetBazelrcFallback(t *testing.T) {
 
 func TestComputeDirtySetBazelVersionFallback(t *testing.T) {
 	changedFiles := map[string]string{".bazelversion": "M"}
-	result := ComputeDirtySet(changedFiles, nil, nil, nil, nil)
+	result := ComputeDirtySet(changedFiles, nil, nil, nil, nil, nil)
 	if !result.NeedsFallback {
 		t.Fatal("expected fallback for .bazelversion change")
 	}
@@ -356,7 +607,7 @@ func TestComputeDirtySetBazelVersionFallback(t *testing.T) {
 
 func TestComputeDirtySetBazelIgnoreFallback(t *testing.T) {
 	changedFiles := map[string]string{".bazelignore": "M"}
-	result := ComputeDirtySet(changedFiles, nil, nil, nil, nil)
+	result := ComputeDirtySet(changedFiles, nil, nil, nil, nil, nil)
 	if !result.NeedsFallback {
 		t.Fatal("expected fallback for .bazelignore change")
 	}
@@ -380,7 +631,7 @@ func TestComputeDirtySetRepositoryMetadataFallbacks(t *testing.T) {
 		"config/common.rc",
 	} {
 		t.Run(path, func(t *testing.T) {
-			result := ComputeDirtySet(map[string]string{path: "M"}, nil, nil, nil, nil)
+			result := ComputeDirtySet(map[string]string{path: "M"}, nil, nil, nil, nil, nil)
 			if !result.NeedsFallback {
 				t.Fatalf("expected fallback for %s", path)
 			}
@@ -393,6 +644,7 @@ func TestComputeDirtySetFallbackTriggerPattern(t *testing.T) {
 		map[string]string{"tools/savvy/etna.yaml": "M"},
 		nil, nil, nil,
 		[]string{"tools/savvy/etna.yaml"},
+		nil,
 	)
 	if !result.NeedsFallback {
 		t.Fatal("expected fallback for file matching fallback trigger pattern")
@@ -407,6 +659,7 @@ func TestComputeDirtySetFallbackTriggerPatternGlob(t *testing.T) {
 		map[string]string{"tools/savvy/etna.yaml": "M"},
 		nil, nil, nil,
 		[]string{"tools/savvy/*.yaml"},
+		nil,
 	)
 	if !result.NeedsFallback {
 		t.Fatal("expected fallback for file matching glob pattern")
@@ -420,6 +673,7 @@ func TestComputeDirtySetFallbackTriggerPatternNoMatch(t *testing.T) {
 		map[string]string{"pkg/src.java": "M"},
 		edges, allLabels, nil,
 		[]string{"tools/savvy/*.yaml"},
+		nil,
 	)
 	if result.NeedsFallback {
 		t.Error("unexpected fallback for file not matching pattern")
@@ -517,7 +771,7 @@ func TestPruneDirtySetEliminatesUnchangedRdeps(t *testing.T) {
 		"tools/binaries/BUILD.bazel": "M",
 	}
 
-	original := ComputeDirtySet(changedFiles, edges, allLabels, nil, nil)
+	original := ComputeDirtySet(changedFiles, edges, allLabels, nil, nil, nil)
 
 	// Verify the unpruned dirty set cascades broadly.
 	if !original.DirtyStarLabels["//app:binary"] {
@@ -576,7 +830,7 @@ func TestPruneDirtySetPreservesChangedRdeps(t *testing.T) {
 	allLabels := CollectAllLabels(edges, nil)
 
 	original := ComputeDirtySet(
-		map[string]string{"lib/BUILD.bazel": "M"}, edges, allLabels, nil, nil,
+		map[string]string{"lib/BUILD.bazel": "M"}, edges, allLabels, nil, nil, nil,
 	)
 
 	seedHashes := map[string]map[string]string{
@@ -608,7 +862,7 @@ func TestPruneDirtySetNoOpWhenAllChanged(t *testing.T) {
 	allLabels := CollectAllLabels(edges, nil)
 
 	original := ComputeDirtySet(
-		map[string]string{"pkg/BUILD.bazel": "M"}, edges, allLabels, nil, nil,
+		map[string]string{"pkg/BUILD.bazel": "M"}, edges, allLabels, nil, nil, nil,
 	)
 
 	seedHashes := map[string]map[string]string{
@@ -641,7 +895,7 @@ func TestPruneDirtySetJudgesSourceFilesByGitNotHash(t *testing.T) {
 	}
 	allLabels := CollectAllLabels(edges, nil)
 	original := ComputeDirtySet(
-		map[string]string{"pkg/edited.java": "M"}, edges, allLabels, nil, nil,
+		map[string]string{"pkg/edited.java": "M"}, edges, allLabels, nil, nil, nil,
 	)
 
 	// Both source files are directly dirty before pruning, and both
@@ -708,7 +962,7 @@ func TestPropagateTraversesThroughUnchangedDirtyLabels(t *testing.T) {
 	}
 	allLabels := CollectAllLabels(edges, nil)
 	original := ComputeDirtySet(
-		map[string]string{"pkg/src.java": "M"}, edges, allLabels, nil, nil,
+		map[string]string{"pkg/src.java": "M"}, edges, allLabels, nil, nil, nil,
 	)
 
 	unchanged := "bbbb0000bbbb0000bbbb0000bbbb0000bbbb0000bbbb0000bbbb0000bbbb0000"
@@ -742,7 +996,7 @@ func TestPruneDirtySetReadsDependencyHashes(t *testing.T) {
 	}
 	allLabels := CollectAllLabels(edges, nil)
 	original := ComputeDirtySet(
-		map[string]string{"pkg/BUILD.bazel": "M"}, edges, allLabels, nil, nil,
+		map[string]string{"pkg/BUILD.bazel": "M"}, edges, allLabels, nil, nil, nil,
 	)
 	if !original.DirtyStarLabels["//app:consumer"] {
 		t.Fatal("expected //app:consumer in unpruned DirtyStarLabels")
@@ -815,7 +1069,7 @@ func TestComputeDirtySetNestedLockExtensionFallsBack(t *testing.T) {
 		"tools/multitool.lock.json": "M",
 	}
 
-	result := ComputeDirtySet(changedFiles, nil, nil, nil, nil)
+	result := ComputeDirtySet(changedFiles, nil, nil, nil, nil, nil)
 
 	if !result.NeedsFallback {
 		t.Fatal("expected fallback for multitool.lock.json change")
@@ -835,7 +1089,7 @@ func TestComputeDirtySetLockNamedScriptDoesNotFallBack(t *testing.T) {
 		"tools/git/merge-pnpm-lock.sh": "M",
 	}
 
-	result := ComputeDirtySet(changedFiles, edges, allLabels, nil, nil)
+	result := ComputeDirtySet(changedFiles, edges, allLabels, nil, nil, nil)
 
 	if result.NeedsFallback {
 		t.Errorf("unexpected fallback for a shell script: %s", result.FallbackReason)

@@ -3,6 +3,8 @@ package main
 import (
 	"encoding/json"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -298,5 +300,70 @@ func TestBuildProbePattern(t *testing.T) {
 				t.Errorf("buildProbePattern(%v) = %q, want %q", tc.packages, got, tc.want)
 			}
 		})
+	}
+}
+
+func TestCarriedScopedLabelsSkipsDirtyAndRemovedPackages(t *testing.T) {
+	dirty := &pkg.DirtySetResult{
+		DirtyStarLabels: map[string]bool{
+			"//dirty:a":   true,
+			"//gone:b":    true,
+			"//carried:c": true,
+			"//carried:d": true,
+		},
+		DirtyPackages:   []string{"//dirty"},
+		RemovedPackages: []string{"//gone"},
+	}
+	seedTargetHashes := map[string]map[string]string{
+		"//dirty:a":   {"": "00"},
+		"//gone:b":    {"": "00"},
+		"//carried:c": {"": "00"},
+	}
+
+	got := carriedScopedLabels(dirty, seedTargetHashes)
+
+	if !reflect.DeepEqual(got, []string{"//carried:c"}) {
+		t.Errorf("carriedScopedLabels = %v, want [//carried:c]", got)
+	}
+}
+
+func TestGitPackagesExist(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	dir := t.TempDir()
+	for _, f := range []string{"BUILD.bazel", "a/b/BUILD.bazel", "c/BUILD", "d/src.java"} {
+		if err := os.MkdirAll(filepath.Join(dir, filepath.Dir(f)), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, f), nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	git := func(args ...string) string {
+		cmd := exec.Command("git", append([]string{"-c", "user.name=t", "-c", "user.email=t@t"}, args...)...)
+		cmd.Dir = dir
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	git("init", "-q")
+	git("add", ".")
+	git("commit", "-qm", "init")
+	sha := git("rev-parse", "HEAD")
+
+	got, err := gitPackagesExist(dir, sha, []string{"//", "//a/b", "//c", "//d", "//missing"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]bool{"//": true, "//a/b": true, "//c": true}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("gitPackagesExist = %v, want %v", got, want)
+	}
+
+	if _, err := gitPackagesExist(dir, "0000000000000000000000000000000000000000", []string{"//a/b"}); err == nil {
+		t.Error("expected an error for an unknown commit")
 	}
 }

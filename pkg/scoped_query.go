@@ -18,7 +18,8 @@ const scopedUniverseVariable = "target_determinator_scoped_universe"
 //   - carried labels — dirty* targets in unchanged packages (i.e. reverse
 //     deps of the dirty packages) — are named explicitly via set(). These
 //     labels are guaranteed to still exist because their BUILD files did not
-//     change and macro (.bzl) changes trigger a full-rehash fallback.
+//     change, removed packages are never carried, and macro (.bzl) changes
+//     trigger a full-rehash fallback.
 //
 // The returned expression is parenthesized so it can be substituted into a
 // larger query expression.
