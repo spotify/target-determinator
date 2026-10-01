@@ -383,6 +383,7 @@ func LoadIncompleteMetadata(context *Context, rev LabelledGitRev, targets Target
 		NoCacheResults:                         context.NoCacheResults,
 		QueryBackend:                           context.QueryBackend,
 		RuleClassFingerprints:                  context.RuleClassFingerprints,
+		OpaqueInputRepositories:                context.OpaqueInputRepositories,
 	}
 	cleanupFunc := func() {}
 
