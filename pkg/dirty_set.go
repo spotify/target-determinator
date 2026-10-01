@@ -62,9 +62,11 @@ type DirtySetResult struct {
 // at the target revision is dirtied as if its BUILD file had changed.
 //
 // packagesExistAtTarget reports which of the given packages still have a
-// BUILD file at the target revision. It is called at most once, only for
-// deleted BUILD files whose sibling BUILD file name does not appear in the
-// diff. If it is nil or fails, such deletions trigger a fallback.
+// BUILD or BUILD.bazel file at the target revision. A package survives the
+// deletion of one of those files if the other one remains. When the other
+// file also appears in the diff, its status answers that directly; only
+// the remaining deletions are looked up, all in a single call. If
+// packagesExistAtTarget is nil or fails, those deletions trigger a fallback.
 //
 // Fallback (full rehash) is triggered by files that can change loading or
 // repository resolution without appearing in target edges: Starlark,
