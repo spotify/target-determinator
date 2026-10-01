@@ -487,6 +487,100 @@ func TestComputeDirtySetBoundaryChangeWithBzlStillFallsBack(t *testing.T) {
 	}
 }
 
+func TestPruneDirtySetAfterNewPackagePropagatesFromMovedFileLabels(t *testing.T) {
+	// //p/d becomes a package, so //p:d/f.txt no longer exists at the target.
+	// //q:user depends on that file directly. //s:unrelated depends only on
+	// //p:other, which has no path from the file and is unchanged.
+	edges := map[string][]string{
+		"//p:lib":       {"//p:d/f.txt"},
+		"//p:other":     {},
+		"//q:user":      {"//p:d/f.txt"},
+		"//s:unrelated": {"//p:other"},
+		"//p:d/f.txt":   {},
+	}
+	changed := map[string]string{"p/d/BUILD.bazel": "A"}
+	original := ComputeDirtySet(changed, edges, CollectAllLabels(edges, nil), nil, nil, nil)
+	if original.NeedsFallback {
+		t.Fatalf("unexpected fallback: %s", original.FallbackReason)
+	}
+
+	libHash := "aaaa0000aaaa0000aaaa0000aaaa0000aaaa0000aaaa0000aaaa0000aaaa0000"
+	otherHash := "eeee0000eeee0000eeee0000eeee0000eeee0000eeee0000eeee0000eeee0000"
+	seed := &PersistedHashData{
+		TargetHashes: map[string]map[string]string{
+			"//p:lib":       {"": libHash},
+			"//p:other":     {"": otherHash},
+			"//q:user":      {"": "bbbb0000bbbb0000bbbb0000bbbb0000bbbb0000bbbb0000bbbb0000bbbb0000"},
+			"//s:unrelated": {"": "cccc0000cccc0000cccc0000cccc0000cccc0000cccc0000cccc0000cccc0000"},
+		},
+		DependencyHashes: map[string]map[string]string{
+			"//p:d/f.txt": {"": "dddd0000dddd0000dddd0000dddd0000dddd0000dddd0000dddd0000dddd0000"},
+		},
+		TargetEdges: edges,
+	}
+	// The probe of //p and //p/d at the target revision no longer sees
+	// //p:d/f.txt at all.
+	probe := ProbeResult{Hashes: map[string]string{
+		"//p:lib\x00":   libHash,
+		"//p:other\x00": otherHash,
+	}}
+
+	if !original.DirtyStarLabels["//s:unrelated"] {
+		t.Fatal("expected //s:unrelated dirty* before pruning")
+	}
+	pruned := PruneDirtySet(original, seed, probe, changed)
+
+	if !pruned.DirtyStarLabels["//q:user"] {
+		t.Error("expected //q:user dirty*: its dep //p:d/f.txt vanished")
+	}
+	if pruned.DirtyStarLabels["//s:unrelated"] {
+		t.Error("//s:unrelated depends only on unchanged //p:other and should be pruned")
+	}
+}
+
+func TestComputeDirtySetDeletedBUILDInUnknownPackageWithSurvivingOther(t *testing.T) {
+	edges := boundarySeedEdges()
+	lookup := &packageLookup{existing: map[string]bool{"//parent/unknown": true}}
+	result := ComputeDirtySet(
+		map[string]string{"parent/unknown/BUILD.bazel": "D"},
+		edges, CollectAllLabels(edges, nil), nil, nil, lookup.lookup,
+	)
+
+	if result.NeedsFallback {
+		t.Fatalf("unexpected fallback: %s", result.FallbackReason)
+	}
+	assertStrings(t, "RemovedPackages", result.RemovedPackages, nil)
+	// No boundary changed, so the enclosing //parent is not dirtied.
+	assertStrings(t, "DirtyPackages", result.DirtyPackages, []string{"//parent/unknown"})
+}
+
+func TestComputeDirtySetDeletedRootPackage(t *testing.T) {
+	edges := boundarySeedEdges()
+	edges["//:root"] = []string{}
+	edges["//app:root_user"] = []string{"//:root"}
+	lookup := &packageLookup{existing: map[string]bool{}}
+	result := ComputeDirtySet(
+		map[string]string{"BUILD.bazel": "D"},
+		edges, CollectAllLabels(edges, nil), nil, nil, lookup.lookup,
+	)
+
+	if result.NeedsFallback {
+		t.Fatalf("unexpected fallback: %s", result.FallbackReason)
+	}
+	assertStrings(t, "RemovedPackages", result.RemovedPackages, []string{"//"})
+	assertStrings(t, "DirtyPackages", result.DirtyPackages, nil)
+	if !result.DirtyLabels["//:root"] {
+		t.Error("expected removed root label //:root dirty")
+	}
+	if !result.DirtyStarLabels["//app:root_user"] {
+		t.Error("expected rdep of the removed root package dirty*")
+	}
+	if len(lookup.calls) != 1 {
+		t.Fatalf("lookup called %d times, want 1", len(lookup.calls))
+	}
+	assertStrings(t, "lookup pkgs", lookup.calls[0], []string{"//"})
+}
+
 func TestPruneDirtySetPreservesRemovedPackages(t *testing.T) {
 	edges := boundarySeedEdges()
 	lookup := &packageLookup{existing: map[string]bool{}}

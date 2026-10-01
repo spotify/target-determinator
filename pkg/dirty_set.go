@@ -282,6 +282,11 @@ func findDirtyPackages(
 			continue
 		}
 		// A source file belongs to the nearest enclosing known package.
+		// Ownership uses the seed's packages because that is where the
+		// file's seed labels live and must be invalidated. Where the target
+		// revision gives the file a different owner, that owner is an added
+		// package or an enclosing package of a boundary change, both
+		// already dirtied above.
 		owner, ok := owningPackage(filePath, knownPackages)
 		if !ok {
 			// No enclosing package: the file cannot be an input to any
