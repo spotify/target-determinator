@@ -346,7 +346,10 @@ func runSeeded(cfg *config) (seededOutcome, error) {
 	// pick up added and deleted targets) and names the rdeps-propagated
 	// targets in unchanged packages explicitly.
 	carriedLabels := carriedScopedLabels(dirtyResult, seedData.TargetHashes)
-	universe := pkg.BuildScopedUniverse(dirtyResult.DirtyPackages, carriedLabels)
+	universe, err := pkg.BuildScopedUniverse(dirtyResult.DirtyPackages, carriedLabels)
+	if err != nil {
+		return fallback("unquotable_scoped_universe", err.Error())
+	}
 	scopedPattern, err := pkg.ScopeTargetsPattern(cfg.Targets.String(), universe)
 	if err != nil {
 		return fallback("unscopable_target_pattern", fmt.Sprintf("cannot scope targets pattern: %v", err))
@@ -478,7 +481,10 @@ func probePackages(
 	// internals). Those labels still appear in the seed's edge map, so the
 	// probe must hash them to prove they are unchanged. ":*" rather than
 	// ":all" so source files are included too.
-	probePattern := buildProbePattern(dirtyPackages)
+	probePattern, err := buildProbePattern(dirtyPackages)
+	if err != nil {
+		return pkg.ProbeResult{}, err
+	}
 	probeTargets, err := pkg.ParseTargetsList(probePattern)
 	if err != nil {
 		return pkg.ProbeResult{}, fmt.Errorf("failed to parse probe targets: %w", err)
@@ -514,19 +520,19 @@ func probePackages(
 
 // buildProbePattern returns a bazel query expression covering every target
 // in the given packages, including manual-tagged rules and source files.
-func buildProbePattern(dirtyPackages []string) string {
+func buildProbePattern(dirtyPackages []string) (string, error) {
 	if len(dirtyPackages) == 0 {
-		return "set()"
+		return "set()", nil
 	}
 	terms := make([]string, 0, len(dirtyPackages))
 	for _, p := range dirtyPackages {
-		if p == "//" {
-			terms = append(terms, "//:*")
-		} else {
-			terms = append(terms, p+":*")
+		pattern, err := pkg.QuoteQueryWord(p + ":*")
+		if err != nil {
+			return "", err
 		}
+		terms = append(terms, pattern)
 	}
-	return "(" + strings.Join(terms, " + ") + ")"
+	return "(" + strings.Join(terms, " + ") + ")", nil
 }
 
 // buildExternalSeedHashes collects seed hashes for all targets NOT in the
