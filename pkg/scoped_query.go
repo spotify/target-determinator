@@ -6,6 +6,19 @@ import (
 	"strings"
 )
 
+// QuoteQueryWord quotes one target pattern or label for the Bazel query lexer.
+// Backslashes do not escape quotes in this grammar. Words containing both quote
+// delimiters cannot be represented, so callers must use their safe fallback.
+func QuoteQueryWord(word string) (string, error) {
+	if !strings.Contains(word, `"`) {
+		return `"` + word + `"`, nil
+	}
+	if !strings.Contains(word, "'") {
+		return "'" + word + "'", nil
+	}
+	return "", fmt.Errorf("cannot quote Bazel query word containing both quote delimiters: %q", word)
+}
+
 const scopedUniverseVariable = "target_determinator_scoped_universe"
 
 // BuildScopedUniverse returns a bazel query expression covering the scoped
@@ -22,25 +35,33 @@ const scopedUniverseVariable = "target_determinator_scoped_universe"
 //     trigger a full-rehash fallback.
 //
 // The returned expression is parenthesized so it can be substituted into a
-// larger query expression.
-func BuildScopedUniverse(dirtyPackages []string, carriedLabels []string) string {
+// larger query expression. An unquotable label or package returns an error so
+// the caller can fall back to a full computation.
+func BuildScopedUniverse(dirtyPackages []string, carriedLabels []string) (string, error) {
 	terms := make([]string, 0, len(dirtyPackages)+1)
 	for _, pkg := range dirtyPackages {
-		if pkg == "//" {
-			terms = append(terms, "//:all")
-		} else {
-			terms = append(terms, pkg+":all")
+		pattern, err := QuoteQueryWord(pkg + ":all")
+		if err != nil {
+			return "", err
 		}
+		terms = append(terms, pattern)
 	}
 	if len(carriedLabels) > 0 {
 		sorted := append([]string(nil), carriedLabels...)
 		sort.Strings(sorted)
+		for i, label := range sorted {
+			word, err := QuoteQueryWord(label)
+			if err != nil {
+				return "", err
+			}
+			sorted[i] = word
+		}
 		terms = append(terms, "set("+strings.Join(sorted, " ")+")")
 	}
 	if len(terms) == 0 {
-		return "set()"
+		return "set()", nil
 	}
-	return "(" + strings.Join(terms, " + ") + ")"
+	return "(" + strings.Join(terms, " + ") + ")", nil
 }
 
 // ScopeTargetsPattern narrows a targets pattern built over //... to the given

@@ -292,11 +292,17 @@ func TestBuildProbePattern(t *testing.T) {
 		want     string
 	}{
 		{"empty", nil, "set()"},
-		{"root", []string{"//"}, "(//:*)"},
-		{"several", []string{"//", "//ci", "//tools/binaries"}, "(//:* + //ci:* + //tools/binaries:*)"},
+		{"root", []string{"//"}, `("//:*")`},
+		{"punctuation", []string{"//pkg+other=one"}, `("//pkg+other=one:*")`},
+		{"quote", []string{`//say"hi`}, `('//say"hi:*')`},
+		{"several", []string{"//", "//ci", "//tools/binaries"}, `("//:*" + "//ci:*" + "//tools/binaries:*")`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := buildProbePattern(tc.packages); got != tc.want {
+			got, err := buildProbePattern(tc.packages)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != tc.want {
 				t.Errorf("buildProbePattern(%v) = %q, want %q", tc.packages, got, tc.want)
 			}
 		})
@@ -365,5 +371,12 @@ func TestGitPackagesExist(t *testing.T) {
 
 	if _, err := gitPackagesExist(dir, "0000000000000000000000000000000000000000", []string{"//a/b"}); err == nil {
 		t.Error("expected an error for an unknown commit")
+	}
+}
+
+func TestBuildProbePatternUnquotableWord(t *testing.T) {
+	got, err := buildProbePattern([]string{`//both'"`})
+	if err == nil || got != "" {
+		t.Fatalf("unquotable word returned pattern %q, error %v", got, err)
 	}
 }
