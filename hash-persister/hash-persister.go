@@ -40,6 +40,7 @@ type hashPersisterFlags struct {
 	reportFile              string
 	fallbackPercent         int
 	fallbackTriggerPatterns fallbackTriggerPatterns
+	certainFallback         string
 }
 
 type config struct {
@@ -71,6 +72,20 @@ type fallbackReason struct {
 	Code   string
 	Detail string
 }
+
+// Values of --certain-fallback. A certain fallback is one that the git diff
+// between --seed-sha and the commit forces on its own, before any seed data is
+// read, so two callers with the same inputs always reach the same decision.
+const (
+	// certainFallbackRun hashes as usual, falling back inline when needed.
+	certainFallbackRun = "run"
+	// certainFallbackSkip exits without hashing when a fallback is certain,
+	// leaving the full hash to a caller running certainFallbackOnly.
+	certainFallbackSkip = "skip"
+	// certainFallbackOnly runs a full hash when a fallback is certain and exits
+	// without hashing otherwise.
+	certainFallbackOnly = "only"
+)
 
 const (
 	// Incremental hashing still pays the fixed costs of loading the seed,
@@ -118,17 +133,12 @@ func execute() (returnErr error) {
 		return err
 	}
 
-	cfg, err := resolveConfig(*flags)
-	if err != nil {
-		return fmt.Errorf("error during preprocessing: %w", err)
-	}
-
 	report := &executionReport{
 		SchemaVersion: 1,
 		RequestedMode: "full",
 		EffectiveMode: "full",
 	}
-	if cfg.SeedFile != "" {
+	if flags.seedFile != "" || flags.certainFallback != certainFallbackRun {
 		report.RequestedMode = "incremental"
 		report.EffectiveMode = "incremental"
 	}
@@ -139,12 +149,47 @@ func execute() (returnErr error) {
 		} else {
 			report.Status = "success"
 		}
-		if cfg.ReportFile != "" {
-			if err := writeExecutionReport(cfg.ReportFile, report); err != nil && returnErr == nil {
+		if flags.reportFile != "" {
+			if err := writeExecutionReport(flags.reportFile, report); err != nil && returnErr == nil {
 				returnErr = err
 			}
 		}
 	}()
+
+	// The precheck runs before resolveConfig so that an early exit never
+	// starts Bazel.
+	certainCode, certainDetail := "", ""
+	if flags.certainFallback != certainFallbackRun {
+		workingDirectory, err := filepath.Abs(*flags.commonFlags.WorkingDirectory)
+		if err != nil {
+			return fmt.Errorf("failed to get working directory from %v: %w", *flags.commonFlags.WorkingDirectory, err)
+		}
+		code, detail, certain := precheckFallback(
+			workingDirectory,
+			flags.seedSha,
+			flags.commitSha,
+			[]pkg.RuleClassFingerprint(*flags.commonFlags.RuleClassFingerprints),
+			flags.fallbackTriggerPatterns,
+		)
+		switch {
+		case certain && flags.certainFallback == certainFallbackSkip:
+			log.Printf("Fallback is certain [%s], skipping: %s", code, detail)
+			report.EffectiveMode = "skipped_certain_fallback"
+			report.FallbackCode = code
+			report.FallbackDetail = detail
+			return nil
+		case !certain && flags.certainFallback == certainFallbackOnly:
+			log.Printf("Fallback is not certain, skipping")
+			report.EffectiveMode = "skipped_not_certain"
+			return nil
+		}
+		certainCode, certainDetail = code, detail
+	}
+
+	cfg, err := resolveConfig(*flags)
+	if err != nil {
+		return fmt.Errorf("error during preprocessing: %w", err)
+	}
 
 	defer func() {
 		innerErr := gitCheckout(cfg.Context.WorkspacePath, cfg.Context.OriginalRevision)
@@ -152,6 +197,17 @@ func execute() (returnErr error) {
 			returnErr = fmt.Errorf("failed to check out original commit during cleanup: %w", innerErr)
 		}
 	}()
+
+	if flags.certainFallback == certainFallbackOnly {
+		log.Printf("Fallback is certain [%s]: %s", certainCode, certainDetail)
+		recomputedTargets, err := runFull(cfg)
+		report.EffectiveMode = "full"
+		report.FallbackCode = certainCode
+		report.FallbackDetail = certainDetail
+		report.RecomputedTargetCount = recomputedTargets
+		report.TotalTargetCount = recomputedTargets
+		return err
+	}
 
 	if cfg.SeedFile != "" {
 		outcome, err := runSeeded(cfg)
@@ -250,12 +306,7 @@ func runSeeded(cfg *config) (seededOutcome, error) {
 	outcome.ChangedFileCount = len(changedFiles)
 	log.Printf("Git diff: %d changed files in %v", len(changedFiles), time.Since(phaseStart))
 
-	fingerprintFiles := make(map[string]bool)
-	for _, fp := range cfg.Context.RuleClassFingerprints {
-		for _, f := range fp.Files {
-			fingerprintFiles[f] = true
-		}
-	}
+	fingerprintFiles := ruleClassFingerprintFiles(cfg.Context.RuleClassFingerprints)
 
 	phaseStart = time.Now()
 	allLabels := pkg.CollectAllLabels(seedData.TargetEdges, seedData.TargetHashes)
@@ -573,6 +624,33 @@ func countDirtySeedTargets(targetHashes map[string]map[string]string, dirtyLabel
 	return count
 }
 
+// precheckFallback reports whether the changes from seedSha to commitSha force
+// a full rehash on their own. It reads only git, so it is cheap and does not
+// depend on the seed. A git error counts as not certain: the seeded run then
+// handles it like any other git_diff_error.
+func precheckFallback(
+	workingDirectory, seedSha, commitSha string,
+	fingerprints []pkg.RuleClassFingerprint,
+	fallbackTriggerPatterns []string,
+) (code, detail string, certain bool) {
+	changedFiles, err := gitDiffNameStatus(workingDirectory, seedSha, commitSha)
+	if err != nil {
+		log.Printf("Fallback precheck cannot compute git diff, treating as not certain: %v", err)
+		return "", "", false
+	}
+	return pkg.FindFallbackTrigger(changedFiles, ruleClassFingerprintFiles(fingerprints), fallbackTriggerPatterns)
+}
+
+func ruleClassFingerprintFiles(fingerprints []pkg.RuleClassFingerprint) map[string]bool {
+	files := make(map[string]bool)
+	for _, fp := range fingerprints {
+		for _, f := range fp.Files {
+			files[f] = true
+		}
+	}
+	return files
+}
+
 func shouldFallbackForRecomputation(recomputedTargets, totalTargets, fallbackPercent int) bool {
 	if totalTargets <= 0 || recomputedTargets <= 0 {
 		return false
@@ -735,6 +813,12 @@ func parseFlags() (*hashPersisterFlags, error) {
 		"fallback-trigger-pattern",
 		"Additional file path pattern (Go path.Match syntax) that forces a full rehash when matched. Repeatable. Matched against the workspace-relative file path.",
 	)
+	flag.StringVar(
+		&flags.certainFallback,
+		"certain-fallback",
+		certainFallbackRun,
+		"What to do when the git diff from --seed-sha alone forces a full rehash: run (hash as usual), skip (exit without hashing when certain), only (full hash when certain, exit without hashing otherwise)",
+	)
 
 	flag.Parse()
 
@@ -746,6 +830,9 @@ func parseFlags() (*hashPersisterFlags, error) {
 		return nil, fmt.Errorf("--seed-sha is required when --seed-file is specified")
 	}
 	if err := validateRecomputationFallbackPercent(flags.fallbackPercent); err != nil {
+		return nil, err
+	}
+	if err := validateCertainFallback(flags.certainFallback, flags.seedFile != "", flags.seedSha != ""); err != nil {
 		return nil, err
 	}
 
@@ -841,6 +928,28 @@ func validateRecomputationFallbackPercent(percent int) error {
 		return fmt.Errorf("--incremental-recomputation-fallback-percent must be between 1 and 100 (got %d)", percent)
 	}
 	return nil
+}
+
+func validateCertainFallback(mode string, hasSeedFile, hasSeedSha bool) error {
+	switch mode {
+	case certainFallbackRun:
+		return nil
+	case certainFallbackSkip:
+		if !hasSeedFile {
+			return fmt.Errorf("--certain-fallback=skip requires --seed-file")
+		}
+		return nil
+	case certainFallbackOnly:
+		if hasSeedFile {
+			return fmt.Errorf("--certain-fallback=only does not read a seed; drop --seed-file")
+		}
+		if !hasSeedSha {
+			return fmt.Errorf("--certain-fallback=only requires --seed-sha")
+		}
+		return nil
+	default:
+		return fmt.Errorf("--certain-fallback must be one of run, skip, only (got %q)", mode)
+	}
 }
 
 func applySeededOutcome(report *executionReport, outcome seededOutcome) {
