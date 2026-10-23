@@ -92,6 +92,8 @@ Incremental hashing is an optimization rather than a weaker correctness mode. If
 
 By default, `hash-persister` also falls back when incremental hashing would recompute at least 70% of the targets in the seed, since the fixed costs of loading and merging the seed are unlikely to pay off. Use `--incremental-recomputation-fallback-percent` to tune that threshold from 1 to 100 for a particular repository.
 
+Some fallbacks are certain before any seed is read: a change between `--seed-sha` and the commit to a fallback trigger file, a `--fallback-trigger-pattern` match, or a rule-class fingerprint file forces a full rehash on its own. `--certain-fallback` lets a caller run that full rehash in parallel with producing the seed. With `skip`, a seeded run exits without writing hashes when the fallback is certain. With `only` (which takes `--seed-sha` but no `--seed-file`), a run performs the full hash when the fallback is certain and exits without writing hashes otherwise. Both decisions come from the same git diff, so for the same `--seed-sha` and commit exactly one of the two runs writes the output. The execution report records `effective_mode` as `skipped_certain_fallback` or `skipped_not_certain` when a run exits early.
+
 To create the first compatible seed, explicitly request seedable output while selecting the `query` backend:
 
 ```sh
