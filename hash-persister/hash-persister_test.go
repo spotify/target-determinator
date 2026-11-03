@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -378,5 +379,48 @@ func TestBuildProbePatternUnquotableWord(t *testing.T) {
 	got, err := buildProbePattern([]string{`//both'"`})
 	if err == nil || got != "" {
 		t.Fatalf("unquotable word returned pattern %q, error %v", got, err)
+	}
+}
+
+func TestValidateSeedHashes(t *testing.T) {
+	for _, dependency := range []bool{false, true} {
+		for _, hash := range []string{strings.Repeat("0a", 32), strings.Repeat("AF", 32), "", "0", "00", strings.Repeat("00", 33), strings.Repeat("gg", 32)} {
+			t.Run(fmt.Sprintf("dependency_%t/hash_%s", dependency, hash), func(t *testing.T) {
+				data := &pkg.PersistedHashData{TargetHashes: map[string]map[string]string{}}
+				hashes := map[string]map[string]string{"//pkg:target": {"cfg1": strings.Repeat("01", 32), "cfg2": hash}}
+				if dependency {
+					data.DependencyHashes = hashes
+				} else {
+					data.TargetHashes = hashes
+				}
+				// Match the validation performed when the decoded map is actually needed.
+				_, oldErr := reusableSeedHashes(data, nil)
+				newErr := validateSeedHashes(data)
+				if (oldErr == nil) != (newErr == nil) {
+					t.Fatalf("validation changed: previous=%v current=%v", oldErr, newErr)
+				}
+			})
+		}
+	}
+	if err := validateSeedHashes(&pkg.PersistedHashData{}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func BenchmarkValidateSeed(b *testing.B) {
+	for _, count := range []int{100000, 500000} {
+		b.Run(fmt.Sprintf("hashes_%d", count), func(b *testing.B) {
+			data := &pkg.PersistedHashData{FormatVersion: pkg.CurrentPersistedHashFormatVersion, GitCommitSha: "seed", SeedCompatibilityFingerprint: "fingerprint", TargetEdges: map[string][]string{}, TargetHashes: make(map[string]map[string]string, count)}
+			for i := 0; i < count; i++ {
+				data.TargetHashes[fmt.Sprintf("//representative/package_%06d:target", i)] = map[string]string{"": strings.Repeat("01", 32)}
+			}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if reason := validateSeed(data, "seed", "fingerprint"); reason != nil {
+					b.Fatal(reason)
+				}
+			}
+		})
 	}
 }

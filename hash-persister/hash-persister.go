@@ -613,8 +613,28 @@ func validateSeed(seedData *pkg.PersistedHashData, expectedSha, expectedFingerpr
 	if seedData.SeedCompatibilityFingerprint != expectedFingerprint {
 		return &fallbackReason{"seed_compatibility_mismatch", "seed compatibility fingerprint does not match this invocation"}
 	}
-	if _, err := reusableSeedHashes(seedData, nil); err != nil {
+	if err := validateSeedHashes(seedData); err != nil {
 		return &fallbackReason{"seed_hash_invalid", fmt.Sprintf("seed contains invalid hashes: %v", err)}
+	}
+	return nil
+}
+
+// validateSeedHashes checks hash encoding and size without building the decoded
+// map needed later for cache seeding. Validation also runs before full-mode
+// fallbacks, where that map would never be used.
+func validateSeedHashes(seedData *pkg.PersistedHashData) error {
+	var decoded [sha256.Size]byte
+	for _, source := range []map[string]map[string]string{seedData.TargetHashes, seedData.DependencyHashes} {
+		for label, configurations := range source {
+			for _, hashHex := range configurations {
+				if len(hashHex) != hex.EncodedLen(sha256.Size) {
+					return fmt.Errorf("invalid hash length for %s: got %d hex characters, want %d", label, len(hashHex), hex.EncodedLen(sha256.Size))
+				}
+				if _, err := hex.Decode(decoded[:], []byte(hashHex)); err != nil {
+					return fmt.Errorf("invalid hash hex for %s: %w", label, err)
+				}
+			}
+		}
 	}
 	return nil
 }
