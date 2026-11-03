@@ -113,6 +113,8 @@ type TargetHashCache struct {
 	// Query-only SHA-256 states after the rule's own attributes, before dependencies.
 	// Written during metadata loading and read-only during concurrent hashing.
 	ruleAttributeHashStates map[*build.Rule][]byte
+	// Attributes discarded during loading cannot be used for difference explanations.
+	attributesDiscarded bool
 
 	context                                  map[gazelle_label.Label]map[Configuration]*analysis.ConfiguredTarget
 	fileHashCache                            *fileHashCache
@@ -349,6 +351,9 @@ func (d Difference) String() string {
 
 // WalkDiffs accumulates the differences of a LabelAndConfiguration before and after a change.
 func WalkDiffs(before *TargetHashCache, after *TargetHashCache, labelAndConfiguration LabelAndConfiguration) ([]Difference, error) {
+	if before.attributesDiscarded || after.attributesDiscarded {
+		return nil, fmt.Errorf("difference explanations require metadata loaded with full attributes")
+	}
 	beforeHash, err := before.Hash(labelAndConfiguration)
 	if err != nil {
 		return nil, err

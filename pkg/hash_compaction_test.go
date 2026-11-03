@@ -165,6 +165,20 @@ func TestHashOnlyMetadataPreservesHashesAndRetainsFullMetadataWhenNeeded(t *test
 				require.NoError(t, err)
 				got.Timestamp = want.Timestamp
 				require.Equal(t, want, got)
+
+				key := LabelAndConfiguration{Label: root, Configuration: configuration}
+				for _, pair := range [][2]*TargetHashCache{
+					{full.TargetHashCache, small.TargetHashCache},
+					{small.TargetHashCache, full.TargetHashCache},
+				} {
+					differences, err := WalkDiffs(pair[0], pair[1], key)
+					if tc.compact {
+						require.ErrorContains(t, err, "difference explanations require metadata loaded with full attributes")
+					} else {
+						require.NoError(t, err)
+					}
+					require.Empty(t, differences)
+				}
 			})
 		}
 	}

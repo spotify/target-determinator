@@ -1022,13 +1022,13 @@ func doQueryDeps(context *Context, targets TargetsList, hashOnly bool) (*QueryRe
 
 func doQueryDepsQueryMode(context *Context, targets TargetsList, normalizer *Normalizer, bazelRelease string, ruleClassFingerprintDigests []RuleClassFingerprintDigests, hashOnly bool) (*QueryResults, error) {
 	depsPattern := fmt.Sprintf("deps(%s)", targets.String())
-	var compactCache *TargetHashCache
+	cache := NewTargetHashCache(nil, normalizer, bazelRelease, true, ruleClassFingerprintDigests, context.OpaqueInputRepositories...)
+	cache.attributesDiscarded = hashOnly
 	var consume func(*build.Target) error
 	if hashOnly {
-		compactCache = NewTargetHashCache(nil, normalizer, bazelRelease, true, ruleClassFingerprintDigests, context.OpaqueInputRepositories...)
 		consume = func(target *build.Target) error {
 			if rule := target.GetRule(); target.GetType() == build.Target_RULE && rule != nil {
-				return compactCache.prehashRuleAttributes(rule)
+				return cache.prehashRuleAttributes(rule)
 			}
 			return nil
 		}
@@ -1042,7 +1042,7 @@ func doQueryDepsQueryMode(context *Context, targets TargetsList, normalizer *Nor
 				labelsToConfigurations: nil,
 			},
 			TransitiveConfiguredTargets: nil,
-			TargetHashCache:             NewTargetHashCache(nil, normalizer, bazelRelease, true, ruleClassFingerprintDigests, context.OpaqueInputRepositories...),
+			TargetHashCache:             cache,
 			BazelRelease:                bazelRelease,
 			QueryError:                  retErr,
 		}, retErr
@@ -1080,16 +1080,15 @@ func doQueryDepsQueryMode(context *Context, targets TargetsList, normalizer *Nor
 		labelsToConfigurations: processedLabelsToConfigurations,
 	}
 
+	// Attach the indexed graph before publishing the cache to hashing workers.
+	cache.context = transitiveConfiguredTargets
 	queryResults := &QueryResults{
 		MatchingTargets:             matchingTargets,
 		TransitiveConfiguredTargets: transitiveConfiguredTargets,
-		TargetHashCache:             NewTargetHashCache(transitiveConfiguredTargets, normalizer, bazelRelease, true, ruleClassFingerprintDigests, context.OpaqueInputRepositories...),
+		TargetHashCache:             cache,
 		BazelRelease:                bazelRelease,
 		QueryError:                  nil,
 		configurations:              map[Configuration]singleConfigurationOutput{},
-	}
-	if compactCache != nil {
-		queryResults.TargetHashCache.ruleAttributeHashStates = compactCache.ruleAttributeHashStates
 	}
 	return queryResults, nil
 }
