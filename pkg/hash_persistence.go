@@ -538,11 +538,120 @@ func LoadPersistedHashes(filePath string) (*PersistedHashData, error) {
 
 	var persistedData PersistedHashData
 	decoder := json.NewDecoder(file)
-	if err := decoder.Decode(&persistedData); err != nil {
+	if err := decodePersistedData(decoder, &persistedData); err != nil {
 		return nil, fmt.Errorf("failed to decode hash data from %s: %w", filePath, err)
 	}
 
 	return &persistedData, nil
+}
+
+// decodePersistedData keeps the decoder's input buffer bounded by one map
+// entry, rather than the entire seed document. A single Decode of the struct
+// reads the whole JSON object into a buffer before allocating its contents.
+func decodePersistedData(decoder *json.Decoder, data *PersistedHashData) error {
+	// Unknown fields can contain numbers outside float64's range. Tokenizing
+	// them as Number preserves encoding/json's behavior of ignoring their values.
+	decoder.UseNumber()
+	token, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	if token == nil {
+		return nil
+	}
+	if token != json.Delim('{') {
+		return fmt.Errorf("expected persisted hash object, got %v", token)
+	}
+	value := reflect.ValueOf(data).Elem()
+	for decoder.More() {
+		token, err := decoder.Token()
+		if err != nil {
+			return err
+		}
+		name := token.(string)
+		found := false
+		for _, field := range persistedDataFields {
+			if !strings.EqualFold(name, field.name) {
+				continue
+			}
+			found = true
+			destination := value.FieldByIndex(field.index)
+			if field.stream {
+				err = decodePersistedMap(decoder, destination)
+			} else {
+				err = decoder.Decode(destination.Addr().Interface())
+			}
+			if err != nil {
+				return fmt.Errorf("field %s: %w", field.name, err)
+			}
+			break
+		}
+		if !found {
+			if err := skipPersistedValue(decoder); err != nil {
+				return err
+			}
+		}
+	}
+	_, err = decoder.Token()
+	return err
+}
+
+// decodePersistedMap decodes one map value at a time. Reuse existing maps so
+// repeated JSON fields merge as they do when decoding a struct with encoding/json.
+func decodePersistedMap(decoder *json.Decoder, destination reflect.Value) error {
+	token, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	if token == nil {
+		destination.SetZero()
+		return nil
+	}
+	if token != json.Delim('{') {
+		return fmt.Errorf("expected map object or null, got %v", token)
+	}
+	if destination.IsNil() {
+		destination.Set(reflect.MakeMap(destination.Type()))
+	}
+	for decoder.More() {
+		token, err := decoder.Token()
+		if err != nil {
+			return err
+		}
+		value := reflect.New(destination.Type().Elem())
+		if err := decoder.Decode(value.Interface()); err != nil {
+			return err
+		}
+		key := reflect.ValueOf(token.(string)).Convert(destination.Type().Key())
+		destination.SetMapIndex(key, value.Elem())
+	}
+	_, err = decoder.Token()
+	return err
+}
+
+// skipPersistedValue skips unknown fields without buffering their entire value.
+func skipPersistedValue(decoder *json.Decoder) error {
+	token, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	if token != json.Delim('{') && token != json.Delim('[') {
+		return nil
+	}
+	depth := 1
+	for depth > 0 {
+		token, err = decoder.Token()
+		if err != nil {
+			return err
+		}
+		switch token {
+		case json.Delim('{'), json.Delim('['):
+			depth++
+		case json.Delim('}'), json.Delim(']'):
+			depth--
+		}
+	}
+	return nil
 }
 
 // HashDiff represents a difference between two hash files
