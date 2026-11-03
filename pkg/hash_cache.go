@@ -247,16 +247,21 @@ func (thc *TargetHashCache) SourceFileLabels() map[string]bool {
 // extractDependencyHashes copies only the requested labels' computed SHA-256
 // hashes. Filtering before copying avoids materializing the entire cache in
 // both raw and hex form when persisting a small set of dependency hashes.
+// It must not run concurrently with Hash: it acquires cacheLock before each
+// entry's hashLock, which is the reverse of Hash's recursive lock order.
 func (thc *TargetHashCache) extractDependencyHashes(wanted map[string]bool) map[string]map[string]string {
 	hashes := make(map[string]map[string]string)
 	thc.cacheLock.Lock()
 	defer thc.cacheLock.Unlock()
-	for label, configurations := range thc.cache {
-		labelString := label.String()
-		if !wanted[labelString] {
+	for labelString := range wanted {
+		// Graph labels already use the cache's canonical spelling. Require
+		// an exact round trip so aliases do not select previously excluded
+		// hashes or change the labels written to the seed.
+		label, err := gazelle_label.Parse(labelString)
+		if err != nil || label.String() != labelString {
 			continue
 		}
-		for configuration, entry := range configurations {
+		for configuration, entry := range thc.cache[label] {
 			entry.hashLock.Lock()
 			// Missing-file sentinels and uncomputed entries must not be persisted:
 			// seeds require SHA-256-sized hashes, and extraction must not compute any.

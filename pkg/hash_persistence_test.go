@@ -563,6 +563,41 @@ func TestExtractDependencyHashesFiltersCache(t *testing.T) {
 	require.Equal(t, first, cache.cache[mustParseLabel("//pkg:dependency")][NormalizeConfiguration("cfg1")].hash)
 }
 
+func TestExtractDependencyHashesCanonicalLabels(t *testing.T) {
+	cache := NewTargetHashCache(nil, &Normalizer{}, "release 8.0.0", true, nil)
+	hash := bytes.Repeat([]byte{0x11}, sha256.Size)
+	require.NoError(t, cache.SeedHashes(map[string][]byte{
+		"//pkg\x00":                            hash,
+		"@external//pkg:dependency\x00":        hash,
+		"@@canonical+repo//pkg:dependency\x00": hash,
+	}))
+	cases := []struct {
+		name  string
+		edges map[string][]string
+		want  map[string]map[string]string
+	}{
+		{
+			name:  "canonical spellings",
+			edges: map[string][]string{"//app:consumer": {"//pkg", "@external//pkg:dependency", "@@canonical+repo//pkg:dependency"}},
+			want: map[string]map[string]string{
+				"//pkg":                            {"": hex.EncodeToString(hash)},
+				"@external//pkg:dependency":        {"": hex.EncodeToString(hash)},
+				"@@canonical+repo//pkg:dependency": {"": hex.EncodeToString(hash)},
+			},
+		},
+		{
+			name:  "aliases and invalid labels do not match cache keys",
+			edges: map[string][]string{"//app:consumer": {"//pkg:pkg", "@//pkg", "//invalid:label:syntax"}},
+			want:  map[string]map[string]string{},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			require.Equal(t, tc.want, ExtractDependencyHashes(nil, tc.edges, cache))
+		})
+	}
+}
+
 func BenchmarkExtractDependencyHashes(b *testing.B) {
 	for _, count := range []int{10000, 100000} {
 		b.Run(fmt.Sprintf("cached_%d", count), func(b *testing.B) {
