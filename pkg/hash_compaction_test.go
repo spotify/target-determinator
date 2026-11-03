@@ -108,68 +108,103 @@ func compactionFixture(t *testing.T) (string, metadataBazel) {
 	}}
 }
 
-func TestHashOnlyMetadataPreservesHashesAndRetainsFullMetadataWhenNeeded(t *testing.T) {
-	for _, tc := range []struct {
-		name, backend      string
-		includeDifferences bool
-		compact            bool
-	}{
-		{name: "query", backend: "query", compact: true},
-		{name: "query with explanations", backend: "query", includeDifferences: true},
-		{name: "cquery", backend: "cquery"},
-	} {
+type metadataLoadingCase struct {
+	name, backend      string
+	includeDifferences bool
+	compact            bool
+}
+
+var metadataLoadingCases = []metadataLoadingCase{
+	{name: "query", backend: "query", compact: true},
+	{name: "query with explanations", backend: "query", includeDifferences: true},
+	{name: "cquery", backend: "cquery"},
+}
+
+type compactionMetadata struct {
+	context          *Context
+	targets          TargetsList
+	full, forHashing *QueryResults
+}
+
+func loadCompactionMetadata(t *testing.T, tc metadataLoadingCase, opaque bool) compactionMetadata {
+	t.Helper()
+	workspace, bazel := compactionFixture(t)
+	ctx := &Context{
+		WorkspacePath: workspace, BazelCmd: bazel, QueryBackend: tc.backend,
+		IncludeDifferences: tc.includeDifferences, AnalysisCacheClearStrategy: "skip",
+		RuleClassFingerprints: []RuleClassFingerprint{{RuleClassGlobs: []string{"java_*"}, Files: []string{"java.rules"}}},
+	}
+	if opaque {
+		ctx.OpaqueInputRepositories = []string{"short"}
+	}
+	targets, err := ParseTargetsList("//pkg:root")
+	require.NoError(t, err)
+	full, cleanup, err := LoadIncompleteMetadata(ctx, NoLabelledGitRev, targets)
+	t.Cleanup(cleanup)
+	require.NoError(t, err)
+	forHashing, cleanup, err := LoadMetadataForHashing(ctx, NoLabelledGitRev, targets)
+	t.Cleanup(cleanup)
+	require.NoError(t, err)
+	return compactionMetadata{context: ctx, targets: targets, full: full, forHashing: forHashing}
+}
+
+func TestHashOnlyMetadataPreservesHashes(t *testing.T) {
+	for _, tc := range metadataLoadingCases {
 		for _, opaque := range []bool{false, true} {
 			t.Run(fmt.Sprintf("%s/opaque_%t", tc.name, opaque), func(t *testing.T) {
-				workspace, bazel := compactionFixture(t)
-				ctx := &Context{
-					WorkspacePath: workspace, BazelCmd: bazel, QueryBackend: tc.backend,
-					IncludeDifferences: tc.includeDifferences, AnalysisCacheClearStrategy: "skip",
-					RuleClassFingerprints: []RuleClassFingerprint{{RuleClassGlobs: []string{"java_*"}, Files: []string{"java.rules"}}},
-				}
-				if opaque {
-					ctx.OpaqueInputRepositories = []string{"short"}
-				}
-				targets, err := ParseTargetsList("//pkg:root")
-				require.NoError(t, err)
-				full, cleanup, err := LoadIncompleteMetadata(ctx, NoLabelledGitRev, targets)
-				defer cleanup()
-				require.NoError(t, err)
-				small, cleanup, err := LoadMetadataForHashing(ctx, NoLabelledGitRev, targets)
-				defer cleanup()
-				require.NoError(t, err)
-
-				root := label.New("", "pkg", "root")
-				configuration := NormalizeConfiguration("")
-				require.NotEmpty(t, full.TransitiveConfiguredTargets[root][configuration].GetTarget().GetRule().Attribute)
-				attributes := small.TransitiveConfiguredTargets[root][configuration].GetTarget().GetRule().Attribute
-				if tc.compact {
-					require.Nil(t, attributes)
-				} else {
-					require.NotEmpty(t, attributes)
-				}
+				metadata := loadCompactionMetadata(t, tc, opaque)
+				full, forHashing := metadata.full, metadata.forHashing
 				require.NoError(t, full.PrefillCache())
-				require.NoError(t, small.PrefillCache())
+				require.NoError(t, forHashing.PrefillCache())
 				for target, configurations := range full.TransitiveConfiguredTargets {
 					for config := range configurations {
 						key := LabelAndConfiguration{Label: target, Configuration: config}
 						want, err := full.TargetHashCache.Hash(key)
 						require.NoError(t, err)
-						got, err := small.TargetHashCache.Hash(key)
+						got, err := forHashing.TargetHashCache.Hash(key)
 						require.NoError(t, err)
 						require.Equal(t, want, got, "hash changed for %s", target)
 					}
 				}
-				want, err := BuildPersistedHashData("commit", full, ctx, targets.String(), tc.backend == "query")
+				want, err := BuildPersistedHashData("commit", full, metadata.context, metadata.targets.String(), tc.backend == "query")
 				require.NoError(t, err)
-				got, err := BuildPersistedHashData("commit", small, ctx, targets.String(), tc.backend == "query")
+				got, err := BuildPersistedHashData("commit", forHashing, metadata.context, metadata.targets.String(), tc.backend == "query")
 				require.NoError(t, err)
 				got.Timestamp = want.Timestamp
 				require.Equal(t, want, got)
+			})
+		}
+	}
+}
 
-				key := LabelAndConfiguration{Label: root, Configuration: configuration}
+func TestHashOnlyMetadataRetainsAttributesWhenNeeded(t *testing.T) {
+	for _, tc := range metadataLoadingCases {
+		for _, opaque := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/opaque_%t", tc.name, opaque), func(t *testing.T) {
+				metadata := loadCompactionMetadata(t, tc, opaque)
+				root := label.New("", "pkg", "root")
+				configuration := NormalizeConfiguration("")
+				require.NotEmpty(t, metadata.full.TransitiveConfiguredTargets[root][configuration].GetTarget().GetRule().Attribute)
+				attributes := metadata.forHashing.TransitiveConfiguredTargets[root][configuration].GetTarget().GetRule().Attribute
+				if tc.compact {
+					require.Nil(t, attributes)
+				} else {
+					require.NotEmpty(t, attributes)
+				}
+			})
+		}
+	}
+}
+
+func TestWalkDiffsRequiresFullAttributes(t *testing.T) {
+	for _, tc := range metadataLoadingCases {
+		for _, opaque := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/opaque_%t", tc.name, opaque), func(t *testing.T) {
+				metadata := loadCompactionMetadata(t, tc, opaque)
+				key := LabelAndConfiguration{Label: label.New("", "pkg", "root"), Configuration: NormalizeConfiguration("")}
 				for _, pair := range [][2]*TargetHashCache{
-					{full.TargetHashCache, small.TargetHashCache},
-					{small.TargetHashCache, full.TargetHashCache},
+					{metadata.full.TargetHashCache, metadata.forHashing.TargetHashCache},
+					{metadata.forHashing.TargetHashCache, metadata.full.TargetHashCache},
 				} {
 					differences, err := WalkDiffs(pair[0], pair[1], key)
 					if tc.compact {
