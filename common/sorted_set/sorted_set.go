@@ -66,6 +66,9 @@ func (s *SortedSet[T]) Add(v T) {
 
 // AddAll adds all of the elements from the other SortedSet to this one.
 func (s *SortedSet[T]) AddAll(other *SortedSet[T]) {
+	if s == nil || s.tree == nil || other == nil || other.tree == nil {
+		return
+	}
 	other.tree.Ascend(func(v T) bool {
 		s.Add(v)
 		return true
@@ -75,6 +78,9 @@ func (s *SortedSet[T]) AddAll(other *SortedSet[T]) {
 // Filter creates a new SortedSet containing only the elements from this one for
 // which the passed predicate evaluates true.
 func (s *SortedSet[T]) Filter(predicate func(T) bool) *SortedSet[T] {
+	if s == nil || s.tree == nil {
+		return nil
+	}
 	new := &SortedSet[T]{
 		tree: s.tree.Clone(),
 	}
@@ -93,6 +99,9 @@ func (s *SortedSet[T]) Filter(predicate func(T) bool) *SortedSet[T] {
 // of mutations on both sets may be worse while initial copies are (lazily)
 // made.
 func (s *SortedSet[T]) Clone() *SortedSet[T] {
+	if s == nil || s.tree == nil {
+		return nil
+	}
 	return &SortedSet[T]{
 		tree: s.tree.Clone(),
 	}
