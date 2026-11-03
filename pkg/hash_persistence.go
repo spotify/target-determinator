@@ -1,13 +1,18 @@
 package pkg
 
 import (
+	"bufio"
 	"crypto/sha256"
+	"encoding"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
+	"reflect"
 	"slices"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/bazel-contrib/target-determinator/third_party/protobuf/bazel/build"
@@ -25,7 +30,7 @@ const (
 
 // PersistedHashData represents the structure of a persisted hash file.
 //
-// FIELD ORDER MATTERS for performance. encoding/json writes fields in
+// FIELD ORDER MATTERS for performance. encodePersistedData writes fields in
 // declaration order, and CompareHashFiles uses a streaming parser that
 // stops reading as soon as it has git_commit_sha and target_hashes.
 // Keeping TargetHashes before TargetEdges and DependencyHashes lets the
@@ -175,20 +180,17 @@ func ExtractEdges(queryResults *QueryResults) (map[string][]string, error) {
 	return edges, nil
 }
 
-// PersistHashes saves computed hashes in the legacy format used by existing
-// full-mode callers. Incremental metadata is omitted to preserve artifact size
-// and behavior unless the caller explicitly requests a seedable artifact.
-func PersistHashes(filePath string, gitCommitSha string, queryResults *QueryResults, context *Context, targetsPattern string) error {
-	return persistHashes(filePath, gitCommitSha, queryResults, context, targetsPattern, false)
-}
-
-// PersistSeedableHashes saves computed hashes together with the dependency
-// graph and compatibility fingerprint required by incremental hashing.
-func PersistSeedableHashes(filePath string, gitCommitSha string, queryResults *QueryResults, context *Context, targetsPattern string) error {
-	return persistHashes(filePath, gitCommitSha, queryResults, context, targetsPattern, true)
-}
-
-func persistHashes(filePath string, gitCommitSha string, queryResults *QueryResults, context *Context, targetsPattern string, seedable bool) error {
+// BuildPersistedHashData extracts everything a hash file records from
+// queryResults. The result holds no reference to queryResults, so callers
+// that are about to write a large file can drop the query graph and hash
+// cache first and let the garbage collector reclaim them during the write.
+// Write the result with WritePersistedData.
+//
+// Without seedable, the result is the legacy format: incremental metadata is
+// omitted to preserve artifact size. With seedable, it also carries the
+// dependency graph and compatibility fingerprint required by incremental
+// hashing.
+func BuildPersistedHashData(gitCommitSha string, queryResults *QueryResults, context *Context, targetsPattern string, seedable bool) (*PersistedHashData, error) {
 	targetHashes := make(map[string]map[string]string)
 	totalTargets := 0
 
@@ -204,7 +206,7 @@ func persistHashes(filePath string, gitCommitSha string, queryResults *QueryResu
 				Configuration: config,
 			})
 			if err != nil {
-				return fmt.Errorf("failed to get hash for target %s with configuration %s: %w", labelStr, config, err)
+				return nil, fmt.Errorf("failed to get hash for target %s with configuration %s: %w", labelStr, config, err)
 			}
 			targetHashes[labelStr][config.String()] = hex.EncodeToString(hash)
 			totalTargets++
@@ -226,19 +228,19 @@ func persistHashes(filePath string, gitCommitSha string, queryResults *QueryResu
 	if seedable {
 		targetEdges, err := ExtractEdges(queryResults)
 		if err != nil {
-			return fmt.Errorf("failed to extract target edges: %w", err)
+			return nil, fmt.Errorf("failed to extract target edges: %w", err)
 		}
 		persistedData.DependencyHashes = ExtractDependencyHashes(targetHashes, targetEdges, queryResults.TargetHashCache)
 		compatibilityFingerprint, err := ComputeSeedCompatibilityFingerprint(context, targetsPattern, queryResults.BazelRelease)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		persistedData.FormatVersion = CurrentPersistedHashFormatVersion
 		persistedData.SeedCompatibilityFingerprint = compatibilityFingerprint
 		persistedData.TargetEdges = targetEdges
 	}
 
-	return writePersistedData(filePath, &persistedData, !seedable)
+	return &persistedData, nil
 }
 
 // ExtractDependencyHashes returns hashes for labels that appear in the edge
@@ -309,24 +311,221 @@ func ExtractDependencyHashes(targetHashes map[string]map[string]string, edges ma
 // Used by the seeded path which builds PersistedHashData by merging seed and
 // freshly computed data instead of extracting from QueryResults.
 func WritePersistedData(filePath string, data *PersistedHashData) error {
-	return writePersistedData(filePath, data, false)
-}
-
-func writePersistedData(filePath string, data *PersistedHashData, pretty bool) error {
 	file, err := os.Create(filePath)
 	if err != nil {
 		return fmt.Errorf("failed to create hash file %s: %w", filePath, err)
 	}
 	defer file.Close()
 
-	encoder := json.NewEncoder(file)
-	if pretty {
-		encoder.SetIndent("", "  ")
-	}
-	if err := encoder.Encode(data); err != nil {
+	buffered := bufio.NewWriterSize(file, 1<<20)
+	if err := encodePersistedData(buffered, data); err != nil {
 		return fmt.Errorf("failed to encode hash data to %s: %w", filePath, err)
 	}
+	if err := buffered.Flush(); err != nil {
+		return fmt.Errorf("failed to write hash data to %s: %w", filePath, err)
+	}
+	if err := file.Close(); err != nil {
+		return fmt.Errorf("failed to close hash file %s: %w", filePath, err)
+	}
 	return nil
+}
+
+// encodePersistedData writes data as compact JSON byte-for-byte identical to
+// json.Encoder.Encode, but streams the large maps one entry at a time.
+// json.Encoder marshals the whole value into memory before writing anything,
+// which for the hash file of a large repository means a buffer of gigabytes on
+// top of the data it was built from.
+//
+// Fields come from PersistedHashData's json tags, in declaration order, so the
+// output follows the struct as it changes. Map fields with string keys are
+// streamed; every other field is marshalled whole.
+//
+// TODO: Replace this writer, streamingObjectEncoder, streamMap and jsonFields
+// with json.MarshalWrite from encoding/json/v2 once the repository builds with
+// Go 1.27 or later, where v2 is no longer behind GOEXPERIMENT. It streams to the
+// writer without buffering the whole value. Pass json.DefaultOptionsV1() (or the
+// equivalent v1 options, including deterministic map key order) to keep the
+// output byte-identical, and measure marshalling speed first: v2 is reported to
+// be slower on many small values, which is this file's shape.
+func encodePersistedData(w io.Writer, data *PersistedHashData) error {
+	enc := &streamingObjectEncoder{w: w}
+	enc.begin()
+	for _, f := range persistedDataFields {
+		v := reflect.ValueOf(data).Elem().FieldByIndex(f.index)
+		if f.omitEmpty && isEmptyJSONValue(v) {
+			continue
+		}
+		enc.key(f.name)
+		if f.stream {
+			streamMap(enc, v)
+		} else {
+			enc.value(v.Interface())
+		}
+	}
+	enc.end()
+	enc.write("\n")
+	return enc.err
+}
+
+type jsonField struct {
+	name      string
+	omitEmpty bool
+	// stream marks a string-keyed map, written one entry at a time.
+	stream bool
+	index  []int
+}
+
+var (
+	jsonMarshalerType = reflect.TypeFor[json.Marshaler]()
+	textMarshalerType = reflect.TypeFor[encoding.TextMarshaler]()
+)
+
+// marshalsItself reports whether encoding/json would encode values of t with
+// t's own MarshalJSON or MarshalText rather than by its structure.
+func marshalsItself(t reflect.Type) bool {
+	for _, candidate := range []reflect.Type{t, reflect.PointerTo(t)} {
+		if candidate.Implements(jsonMarshalerType) || candidate.Implements(textMarshalerType) {
+			return true
+		}
+	}
+	return false
+}
+
+var persistedDataFields = jsonFields(reflect.TypeFor[PersistedHashData]())
+
+// jsonFields lists the fields encoding/json would emit for t, which must be a
+// struct without embedded fields.
+func jsonFields(t reflect.Type) []jsonField {
+	var fields []jsonField
+	for i := 0; i < t.NumField(); i++ {
+		sf := t.Field(i)
+		// Checked before exportedness: encoding/json promotes the exported
+		// fields of an embedded struct even when its type is unexported.
+		if sf.Anonymous {
+			panic(fmt.Sprintf("%s.%s: embedded fields are not supported by the streaming writer", t.Name(), sf.Name))
+		}
+		if !sf.IsExported() {
+			continue
+		}
+		tag := sf.Tag.Get("json")
+		if tag == "-" {
+			continue
+		}
+		name, opts, _ := strings.Cut(tag, ",")
+		if name == "" {
+			name = sf.Name
+		}
+		omitEmpty := false
+		for _, opt := range strings.Split(opts, ",") {
+			switch opt {
+			case "omitempty":
+				omitEmpty = true
+			case "":
+			default:
+				panic(fmt.Sprintf("%s.%s: json option %q is not supported by the streaming writer", t.Name(), sf.Name, opt))
+			}
+		}
+		stream := sf.Type.Kind() == reflect.Map && sf.Type.Key().Kind() == reflect.String
+		if stream {
+			// encoding/json would encode such a map with the type's own
+			// MarshalJSON or MarshalText, which streamMap does not reproduce.
+			if marshalsItself(sf.Type) {
+				panic(fmt.Sprintf("%s.%s: map types with their own JSON or text marshalling are not supported by the streaming writer", t.Name(), sf.Name))
+			}
+			// encoding/json writes such keys with MarshalText, which
+			// streamMap does not reproduce.
+			key := sf.Type.Key()
+			if key.Implements(textMarshalerType) || reflect.PointerTo(key).Implements(textMarshalerType) {
+				panic(fmt.Sprintf("%s.%s: map keys implementing encoding.TextMarshaler are not supported by the streaming writer", t.Name(), sf.Name))
+			}
+		}
+		fields = append(fields, jsonField{name: name, omitEmpty: omitEmpty, stream: stream, index: sf.Index})
+	}
+	return fields
+}
+
+// isEmptyJSONValue reports whether encoding/json's omitempty would drop v.
+func isEmptyJSONValue(v reflect.Value) bool {
+	switch v.Kind() {
+	case reflect.Array, reflect.Map, reflect.Slice, reflect.String:
+		return v.Len() == 0
+	case reflect.Bool,
+		reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr,
+		reflect.Float32, reflect.Float64,
+		reflect.Interface, reflect.Pointer:
+		return v.IsZero()
+	}
+	return false
+}
+
+// streamingObjectEncoder emits compact JSON objects member by member.
+type streamingObjectEncoder struct {
+	w io.Writer
+	// first tracks, per open object, whether no member has been written yet.
+	first []bool
+	err   error
+}
+
+func (e *streamingObjectEncoder) write(s string) {
+	if e.err == nil {
+		_, e.err = io.WriteString(e.w, s)
+	}
+}
+
+func (e *streamingObjectEncoder) begin() {
+	e.write("{")
+	e.first = append(e.first, true)
+}
+
+func (e *streamingObjectEncoder) end() {
+	e.first = e.first[:len(e.first)-1]
+	e.write("}")
+}
+
+func (e *streamingObjectEncoder) key(name string) {
+	top := len(e.first) - 1
+	if !e.first[top] {
+		e.write(",")
+	}
+	e.first[top] = false
+	e.value(name)
+	e.write(":")
+}
+
+func (e *streamingObjectEncoder) value(v any) {
+	if e.err != nil {
+		return
+	}
+	b, err := json.Marshal(v)
+	if err != nil {
+		e.err = err
+		return
+	}
+	_, e.err = e.w.Write(b)
+}
+
+// streamMap writes the string-keyed map m with sorted keys, as encoding/json
+// does, marshalling one entry at a time so that only a single value is ever
+// buffered.
+func streamMap(e *streamingObjectEncoder, m reflect.Value) {
+	if m.IsNil() {
+		e.write("null")
+		return
+	}
+	keys := m.MapKeys()
+	slices.SortFunc(keys, func(a, b reflect.Value) int {
+		return strings.Compare(a.String(), b.String())
+	})
+	e.begin()
+	for _, k := range keys {
+		if e.err != nil {
+			return
+		}
+		e.key(k.String())
+		e.value(m.MapIndex(k).Interface())
+	}
+	e.end()
 }
 
 // LoadPersistedHashes loads persisted hash data from a JSON file
