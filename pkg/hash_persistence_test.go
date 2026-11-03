@@ -71,9 +71,9 @@ func TestSeedableFormatSizeDelta(t *testing.T) {
 		},
 	}
 
-	// Legacy PersistHashes output is indented; seedable output is compact to
-	// offset some of the additional dependency-graph cost.
-	v8JSON, err := json.MarshalIndent(v8Data, "", "  ")
+	// Both legacy and seedable output are written compact, which offsets
+	// some of the additional dependency-graph cost.
+	v8JSON, err := json.Marshal(v8Data)
 	if err != nil {
 		t.Fatalf("failed to marshal v8: %v", err)
 	}
@@ -334,15 +334,13 @@ func TestPersistenceModesPreserveHashesAndGeneratedFileEdges(t *testing.T) {
 		QueryBackend:  "query",
 	}
 	legacyPath := filepath.Join(t.TempDir(), "legacy.json")
-	if err := PersistHashes(legacyPath, "abc123", queryResults, context, "//..."); err != nil {
-		t.Fatal(err)
-	}
+	persistToFile(t, legacyPath, queryResults, context, false)
 	legacyRaw, err := os.ReadFile(legacyPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(legacyRaw), "\n  \"git_commit_sha\"") {
-		t.Fatal("legacy output is no longer pretty-printed")
+	if strings.Contains(string(legacyRaw), "\n  ") {
+		t.Fatal("legacy output is unexpectedly indented")
 	}
 	legacy, err := LoadPersistedHashes(legacyPath)
 	if err != nil {
@@ -353,9 +351,7 @@ func TestPersistenceModesPreserveHashesAndGeneratedFileEdges(t *testing.T) {
 	}
 
 	seedablePath := filepath.Join(t.TempDir(), "seedable.json")
-	if err := PersistSeedableHashes(seedablePath, "abc123", queryResults, context, "//..."); err != nil {
-		t.Fatal(err)
-	}
+	persistToFile(t, seedablePath, queryResults, context, true)
 	seedable, err := LoadPersistedHashes(seedablePath)
 	if err != nil {
 		t.Fatal(err)
@@ -529,6 +525,134 @@ func TestExtractEdgesCanonicalisesRepeatedLabelsConsistently(t *testing.T) {
 			t.Errorf("%q should appear canonicalised as %q, got %v",
 				input, parsed.String(), edges[consumer.String()])
 		}
+	}
+}
+
+func TestStreamingWriterMatchesEncodingJSON(t *testing.T) {
+	for name, data := range streamingWriterCases() {
+		t.Run(name, func(t *testing.T) {
+			var want bytes.Buffer
+			if err := json.NewEncoder(&want).Encode(data); err != nil {
+				t.Fatal(err)
+			}
+			var got bytes.Buffer
+			if err := encodePersistedData(&got, data); err != nil {
+				t.Fatal(err)
+			}
+			if got.String() != want.String() {
+				t.Errorf("streamed output differs from encoding/json\ngot:\n%s\nwant:\n%s", got.String(), want.String())
+			}
+		})
+	}
+}
+
+func TestStreamingWriterOutputIsReadable(t *testing.T) {
+	for name, data := range streamingWriterCases() {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "hashes.json")
+			if err := WritePersistedData(path, data); err != nil {
+				t.Fatal(err)
+			}
+			loaded, err := LoadPersistedHashes(path)
+			if err != nil {
+				t.Fatalf("LoadPersistedHashes: %v", err)
+			}
+			if !reflect.DeepEqual(loaded, data) {
+				t.Errorf("round trip mismatch\ngot:  %#v\nwant: %#v", loaded, data)
+			}
+			if _, err := CompareHashFiles(path, path); err != nil {
+				t.Fatalf("CompareHashFiles: %v", err)
+			}
+		})
+	}
+}
+
+// streamingWriterCases covers the encoding edge cases the streaming writer
+// must reproduce: key sorting, HTML escaping, omitempty fields, and empty
+// inner values. Each case round-trips through LoadPersistedHashes unchanged.
+func streamingWriterCases() map[string]*PersistedHashData {
+	ts := time.Date(2026, 11, 3, 12, 0, 0, 123, time.UTC)
+	return map[string]*PersistedHashData{
+		"full": {
+			FormatVersion:                CurrentPersistedHashFormatVersion,
+			SeedCompatibilityFingerprint: "fingerprint",
+			GitCommitSha:                 "abc123",
+			Timestamp:                    ts,
+			BazelRelease:                 "release 8.0.0",
+			TargetHashes: map[string]map[string]string{
+				"//b:target":  {"cfg2": "02", "cfg1": "01"},
+				"//a:<html>&": {"": "ff"},
+				"//c:empty":   {},
+			},
+			TargetEdges: map[string][]string{
+				"//b:target": {"//a:<html>&", "//c:empty"},
+				"//a:none":   {},
+			},
+			DependencyHashes: map[string]map[string]string{
+				"//dep:manual": {"": "aa"},
+			},
+			Metadata: HashMetadata{TargetsPattern: "//...", WorkspacePath: "/ws", TotalTargets: 3},
+		},
+		"legacy": {
+			GitCommitSha: "abc",
+			Timestamp:    ts,
+			TargetHashes: map[string]map[string]string{"//x": {"": "00"}},
+		},
+		"no targets": {
+			Timestamp:    ts,
+			TargetHashes: map[string]map[string]string{},
+		},
+	}
+}
+
+// persistToFile builds hash data from queryResults and writes it to path, as
+// the persister does.
+func persistToFile(t *testing.T, path string, queryResults *QueryResults, context *Context, seedable bool) {
+	t.Helper()
+	data, err := BuildPersistedHashData("abc123", queryResults, context, "//...", seedable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := WritePersistedData(path, data); err != nil {
+		t.Fatal(err)
+	}
+}
+
+type textKey string
+
+type selfMarshallingMap map[string]string
+
+func (selfMarshallingMap) MarshalJSON() ([]byte, error) { return []byte(`"custom"`), nil }
+
+type textMarshallingMap map[string]string
+
+func (*textMarshallingMap) MarshalText() ([]byte, error) { return []byte("custom"), nil }
+
+func (k textKey) MarshalText() ([]byte, error) { return []byte("x" + string(k)), nil }
+
+func TestJSONFieldsRejectsUnsupportedFields(t *testing.T) {
+	type embedded struct{}
+	cases := map[string]reflect.Type{
+		"embedded": reflect.TypeFor[struct{ embedded }](),
+		"string option": reflect.TypeFor[struct {
+			N int `json:"n,string"`
+		}](),
+		"omitzero": reflect.TypeFor[struct {
+			N int `json:"n,omitzero"`
+		}](),
+		"text marshaler key": reflect.TypeFor[struct{ M map[textKey]string }](),
+		"json marshaler map": reflect.TypeFor[struct{ M selfMarshallingMap }](),
+		"text marshaler map": reflect.TypeFor[struct{ M textMarshallingMap }](),
+	}
+	for name, typ := range cases {
+		t.Run(name, func(t *testing.T) {
+			defer func() {
+				if recover() == nil {
+					t.Fatalf("jsonFields(%v) did not panic", typ)
+				}
+			}()
+			jsonFields(typ)
+		})
 	}
 }
 
