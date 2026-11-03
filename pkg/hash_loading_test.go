@@ -8,6 +8,8 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/stretchr/testify/require"
 )
 
 func TestLoadPersistedHashesMatchesJSONDecoder(t *testing.T) {
@@ -65,6 +67,71 @@ func BenchmarkLoadPersistedHashes(b *testing.B) {
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
 				if _, err := LoadPersistedHashes(path); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+func TestLoadHashesForDiffSharedReader(t *testing.T) {
+	for name, input := range map[string]string{
+		"hashes first":         `{"target_hashes":{"//pkg:a":{"":"01"}},"git_commit_sha":"seed"}`,
+		"unknown fields first": `{"future":{"nested":[1e1000,null,{"x":[1,2]}]},"target_edges":{"//pkg:a":["//pkg:b"]},"git_commit_sha":"seed","target_hashes":{"//pkg:a":{"":"01"}}}`,
+		"stop before graph":    `{"git_commit_sha":"seed","target_hashes":{"//pkg:a":{"":"01"}},"target_edges":invalid`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "hashes.json")
+			require.NoError(t, os.WriteFile(path, []byte(input), 0600))
+			sha, hashes, err := loadHashesForDiff(path)
+			require.NoError(t, err)
+			require.Equal(t, "seed", sha)
+			require.Equal(t, map[string]map[string]string{"//pkg:a": {"": "01"}}, hashes)
+			if name == "stop before graph" {
+				_, err := LoadPersistedHashes(path)
+				require.Error(t, err)
+			}
+		})
+	}
+	for _, input := range []string{`{}`, `null`, `{"git_commit_sha":"seed","target_hashes":null}`, `{"target_hashes":[]}`, `{"future":[1,}`} {
+		path := filepath.Join(t.TempDir(), "invalid.json")
+		require.NoError(t, os.WriteFile(path, []byte(input), 0600))
+		_, _, err := loadHashesForDiff(path)
+		require.Error(t, err)
+	}
+}
+
+func BenchmarkLoadHashesForDiff(b *testing.B) {
+	data := &PersistedHashData{GitCommitSha: "seed", TargetHashes: make(map[string]map[string]string, 100000), TargetEdges: make(map[string][]string, 100000)}
+	for i := 0; i < 100000; i++ {
+		label := fmt.Sprintf("//representative/package_%06d:target", i)
+		data.TargetHashes[label] = map[string]string{"": strings.Repeat("01", 32)}
+		data.TargetEdges[label] = []string{label + "_source", label + "_dependency"}
+	}
+	for _, graphFirst := range []bool{false, true} {
+		b.Run(fmt.Sprintf("graph_first_%t", graphFirst), func(b *testing.B) {
+			path := filepath.Join(b.TempDir(), "hashes.json")
+			var content []byte
+			var err error
+			if graphFirst {
+				content, err = json.Marshal(struct {
+					Edges  map[string][]string          `json:"target_edges"`
+					Sha    string                       `json:"git_commit_sha"`
+					Hashes map[string]map[string]string `json:"target_hashes"`
+				}{data.TargetEdges, data.GitCommitSha, data.TargetHashes})
+			} else {
+				content, err = json.Marshal(data)
+			}
+			if err != nil {
+				b.Fatal(err)
+			}
+			if err := os.WriteFile(path, content, 0600); err != nil {
+				b.Fatal(err)
+			}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if _, _, err := loadHashesForDiff(path); err != nil {
 					b.Fatal(err)
 				}
 			}
