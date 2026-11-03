@@ -613,14 +613,31 @@ func validateSeed(seedData *pkg.PersistedHashData, expectedSha, expectedFingerpr
 	if seedData.SeedCompatibilityFingerprint != expectedFingerprint {
 		return &fallbackReason{"seed_compatibility_mismatch", "seed compatibility fingerprint does not match this invocation"}
 	}
-	if _, err := reusableSeedHashes(seedData, nil); err != nil {
+	if err := validateSeedHashes(seedData); err != nil {
 		return &fallbackReason{"seed_hash_invalid", fmt.Sprintf("seed contains invalid hashes: %v", err)}
 	}
 	return nil
 }
 
+// validateSeedHashes checks hash encoding and size without building the decoded
+// map needed later for cache seeding. Validation also runs before full-mode
+// fallbacks, where that map would never be used.
+func validateSeedHashes(seedData *pkg.PersistedHashData) error {
+	return decodeSeedHashes(seedData, nil, nil)
+}
+
 func reusableSeedHashes(seedData *pkg.PersistedHashData, dirtyLabels map[string]bool) (map[string][]byte, error) {
 	hashes := make(map[string][]byte)
+	if err := decodeSeedHashes(seedData, dirtyLabels, hashes); err != nil {
+		return nil, err
+	}
+	return hashes, nil
+}
+
+// decodeSeedHashes validates reusable hashes and optionally copies them into
+// hashes. A nil destination performs validation without retaining decoded hashes.
+func decodeSeedHashes(seedData *pkg.PersistedHashData, dirtyLabels map[string]bool, hashes map[string][]byte) error {
+	var decoded [sha256.Size]byte
 	// Dependency hashes are as reusable as target hashes for seeding the
 	// cache; they are only kept in a separate bucket so that diffing sees
 	// the target set alone.
@@ -630,18 +647,19 @@ func reusableSeedHashes(seedData *pkg.PersistedHashData, dirtyLabels map[string]
 				continue
 			}
 			for configStr, hashHex := range configMap {
-				hashBytes, err := hex.DecodeString(hashHex)
-				if err != nil {
-					return nil, fmt.Errorf("invalid hash hex for %s: %w", label, err)
+				if len(hashHex) != hex.EncodedLen(sha256.Size) {
+					return fmt.Errorf("invalid hash length for %s: got %d hex characters, want %d", label, len(hashHex), hex.EncodedLen(sha256.Size))
 				}
-				if len(hashBytes) != sha256.Size {
-					return nil, fmt.Errorf("invalid hash length for %s: got %d bytes, want %d", label, len(hashBytes), sha256.Size)
+				if _, err := hex.Decode(decoded[:], []byte(hashHex)); err != nil {
+					return fmt.Errorf("invalid hash hex for %s: %w", label, err)
 				}
-				hashes[label+"\x00"+configStr] = hashBytes
+				if hashes != nil {
+					hashes[label+"\x00"+configStr] = append([]byte(nil), decoded[:]...)
+				}
 			}
 		}
 	}
-	return hashes, nil
+	return nil
 }
 
 func mergePersistedData(

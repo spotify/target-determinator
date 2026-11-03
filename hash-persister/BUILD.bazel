@@ -16,7 +16,11 @@ go_test(
     name = "hash-persister_test",
     srcs = ["hash-persister_test.go"],
     embed = [":hash-persister_lib"],
-    deps = ["//pkg"],
+    deps = [
+        "//pkg",
+        "@com_github_stretchr_testify//assert",
+        "@com_github_stretchr_testify//require",
+    ],
 )
 
 multi_platform_go_binary(
