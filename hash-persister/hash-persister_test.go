@@ -11,6 +11,8 @@ import (
 	"testing"
 
 	"github.com/bazel-contrib/target-determinator/pkg"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestValidateSeed(t *testing.T) {
@@ -393,11 +395,12 @@ func TestValidateSeedHashes(t *testing.T) {
 				} else {
 					data.TargetHashes = hashes
 				}
-				// Match the validation performed when the decoded map is actually needed.
-				_, oldErr := reusableSeedHashes(data, nil)
-				newErr := validateSeedHashes(data)
-				if (oldErr == nil) != (newErr == nil) {
-					t.Fatalf("validation changed: previous=%v current=%v", oldErr, newErr)
+				wantValid := hash == strings.Repeat("0a", 32) || hash == strings.Repeat("AF", 32)
+				if err := validateSeedHashes(data); (err == nil) != wantValid {
+					t.Fatalf("validation error = %v, want valid = %t", err, wantValid)
+				}
+				if _, err := reusableSeedHashes(data, nil); (err == nil) != wantValid {
+					t.Fatalf("seeding error = %v, want valid = %t", err, wantValid)
 				}
 			})
 		}
@@ -405,6 +408,30 @@ func TestValidateSeedHashes(t *testing.T) {
 	if err := validateSeedHashes(&pkg.PersistedHashData{}); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestReusableSeedHashesCopiesHashesAndSkipsDirtyLabels(t *testing.T) {
+	data := &pkg.PersistedHashData{
+		TargetHashes: map[string]map[string]string{
+			"//pkg:clean": {"cfg1": strings.Repeat("01", 32), "cfg2": strings.Repeat("02", 32)},
+			"//pkg:dirty": {"cfg": "invalid"},
+		},
+		DependencyHashes: map[string]map[string]string{
+			"//dep:clean": {"cfg": strings.Repeat("03", 32)},
+			"//dep:dirty": {"cfg": "invalid"},
+		},
+	}
+	hashes, err := reusableSeedHashes(data, map[string]bool{"//pkg:dirty": true, "//dep:dirty": true})
+	require.NoError(t, err)
+	want := map[string][]byte{
+		"//pkg:clean\x00cfg1": []byte(strings.Repeat("\x01", 32)),
+		"//pkg:clean\x00cfg2": []byte(strings.Repeat("\x02", 32)),
+		"//dep:clean\x00cfg":  []byte(strings.Repeat("\x03", 32)),
+	}
+	require.Equal(t, want, hashes)
+	hashes["//pkg:clean\x00cfg1"][0] = 0xff
+	assert.Equal(t, want["//pkg:clean\x00cfg2"], hashes["//pkg:clean\x00cfg2"])
+	assert.Equal(t, want["//dep:clean\x00cfg"], hashes["//dep:clean\x00cfg"])
 }
 
 func BenchmarkValidateSeed(b *testing.B) {
