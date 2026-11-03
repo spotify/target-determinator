@@ -194,11 +194,17 @@ func runFull(cfg *config) (int, error) {
 
 	phaseStart = time.Now()
 	log.Printf("Persisting hashes to %s", cfg.OutputFile)
-	persist := pkg.PersistHashes
-	if cfg.SeedableOutput {
-		persist = pkg.PersistSeedableHashes
+	persistedData, err := pkg.BuildPersistedHashData(cfg.CommitSha, queryResults, cfg.Context, cfg.Targets.String(), cfg.SeedableOutput)
+	if err != nil {
+		return 0, fmt.Errorf("failed to collect hash data for commit %s: %w", cfg.CommitSha, err)
 	}
-	if err := persist(cfg.OutputFile, cfg.CommitSha, queryResults, cfg.Context, cfg.Targets.String()); err != nil {
+	// The query graph and hash cache are the bulk of the heap and nothing
+	// below needs them. They are already collectable here because nothing
+	// reads queryResults past this point; clearing it is defensive, so that a
+	// later use added below panics instead of silently keeping the graph
+	// alive while the hash file is written.
+	queryResults = nil
+	if err := pkg.WritePersistedData(cfg.OutputFile, persistedData); err != nil {
 		return 0, fmt.Errorf("failed to persist hashes: %w", err)
 	}
 	log.Printf("Phase persist completed in %v", time.Since(phaseStart))
@@ -399,6 +405,17 @@ func runSeeded(cfg *config) (seededOutcome, error) {
 	if err != nil {
 		return seededOutcome{}, err
 	}
+	recomputedTargets := len(queryResults.MatchingTargets.Labels())
+	// persistedData holds everything still needed. The query graph, hash
+	// cache, seed and dirty set are already collectable here because nothing
+	// reads them past this point; clearing them is defensive, so that a later
+	// use added below panics instead of silently keeping them alive while the
+	// hash file is written.
+	queryResults = nil
+	seedData = nil
+	dirtyResult = nil
+	seedHashes = nil
+	allLabels = nil
 
 	if err := pkg.WritePersistedData(cfg.OutputFile, persistedData); err != nil {
 		return seededOutcome{}, fmt.Errorf("failed to persist merged hashes: %w", err)
@@ -406,9 +423,9 @@ func runSeeded(cfg *config) (seededOutcome, error) {
 	log.Printf("Phase persist+merge completed in %v", time.Since(phaseStart))
 
 	log.Printf("Successfully persisted %d target hashes to %s (seeded mode, %d recomputed)",
-		len(persistedData.TargetHashes), cfg.OutputFile, len(queryResults.MatchingTargets.Labels()))
+		len(persistedData.TargetHashes), cfg.OutputFile, recomputedTargets)
 	outcome.UsedSeed = true
-	outcome.RecomputedTargetCount = len(queryResults.MatchingTargets.Labels())
+	outcome.RecomputedTargetCount = recomputedTargets
 	outcome.TotalTargetCount = len(persistedData.TargetHashes)
 	outcome.ReusedTargetCount = outcome.TotalTargetCount - outcome.RecomputedTargetCount
 	return outcome, nil
