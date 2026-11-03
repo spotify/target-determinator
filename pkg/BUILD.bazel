@@ -40,6 +40,7 @@ go_test(
         "cache_test.go",
         "dirty_set_test.go",
         "hash_cache_test.go",
+        "hash_compaction_test.go",
         "hash_persistence_test.go",
         "normalizer_test.go",
         "scoped_query_test.go",
@@ -59,6 +60,7 @@ go_test(
         "@com_github_otiai10_copy//:copy",
         "@com_github_stretchr_testify//assert",
         "@com_github_stretchr_testify//require",
+        "@org_golang_google_protobuf//encoding/protodelim",
         "@org_golang_google_protobuf//proto",
     ],
 )

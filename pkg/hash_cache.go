@@ -3,10 +3,12 @@ package pkg
 import (
 	"bytes"
 	"crypto/sha256"
+	"encoding"
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"log"
 	"os"
@@ -108,6 +110,10 @@ func isConfiguredRuleInputsSupported(releaseString string) bool {
 // In the future we may pre-cache file hashes to avoid this hazard (and to allow more efficient
 // use of threadpools when hashing files).
 type TargetHashCache struct {
+	// Query-only SHA-256 states after the rule's own attributes, before dependencies.
+	// Written during metadata loading and read-only during concurrent hashing.
+	ruleAttributeHashStates map[*build.Rule][]byte
+
 	context                                  map[gazelle_label.Label]map[Configuration]*analysis.ConfiguredTarget
 	fileHashCache                            *fileHashCache
 	bazelRelease                             string
@@ -693,8 +699,51 @@ func hashTarget(thc *TargetHashCache, labelAndConfiguration LabelAndConfiguratio
 	}
 }
 
+// ruleHasher preserves the unfinished SHA-256 computation, so dependency
+// bytes are appended exactly as before rather than hashing a hash of attributes.
+func ruleHasher(thc *TargetHashCache, rule *build.Rule, configuration *analysis.Configuration) (hash.Hash, error) {
+	if state, ok := thc.ruleAttributeHashStates[rule]; ok {
+		hasher := sha256.New()
+		if err := hasher.(encoding.BinaryUnmarshaler).UnmarshalBinary(state); err != nil {
+			return nil, err
+		}
+		return hasher, nil
+	}
+	return hashRuleOwnAttributes(thc, rule, configuration)
+}
+
+func (thc *TargetHashCache) prehashRuleAttributes(rule *build.Rule) error {
+	// Query metadata has no configurations. Opaque rules contribute their identity
+	// only, so their attributes can be dropped without computing a prefix.
+	label, err := thc.normalizer.ParseCanonicalLabel(rule.GetName())
+	if err != nil {
+		return err
+	}
+	if _, opaque := thc.opaqueInputRepositories[label.Repo]; label.Repo != "" && opaque {
+		rule.Attribute = nil
+		return nil
+	}
+	// The regular path normalizes during ParseCqueryResult, then redacts and
+	// normalizes again in AttributeForSerialization. Preserve that sequence.
+	normalizeRuleAttributes(rule, thc.normalizer)
+	hasher, err := hashRuleOwnAttributes(thc, rule, nil)
+	if err != nil {
+		return err
+	}
+	state, err := hasher.(encoding.BinaryMarshaler).MarshalBinary()
+	if err != nil {
+		return err
+	}
+	if thc.ruleAttributeHashStates == nil {
+		thc.ruleAttributeHashStates = make(map[*build.Rule][]byte)
+	}
+	thc.ruleAttributeHashStates[rule] = state
+	rule.Attribute = nil
+	return nil
+}
+
 // If this function changes, so should WalkDiffs.
-func hashRule(thc *TargetHashCache, rule *build.Rule, configuration *analysis.Configuration) ([]byte, error) {
+func hashRuleOwnAttributes(thc *TargetHashCache, rule *build.Rule, configuration *analysis.Configuration) (hash.Hash, error) {
 	hasher := sha256.New()
 	// Mix in the Bazel version, because Bazel versions changes may cause differences to how rules
 	// are evaluated even if the rules themselves haven't changed.
@@ -726,6 +775,16 @@ func hashRule(thc *TargetHashCache, rule *build.Rule, configuration *analysis.Co
 		}
 
 		hasher.Write(protoBytes)
+	}
+
+	return hasher, nil
+}
+
+// If this function changes, so should WalkDiffs.
+func hashRule(thc *TargetHashCache, rule *build.Rule, configuration *analysis.Configuration) ([]byte, error) {
+	hasher, err := ruleHasher(thc, rule, configuration)
+	if err != nil {
+		return nil, err
 	}
 
 	ownConfiguration := NormalizeConfiguration(configuration.GetChecksum())
