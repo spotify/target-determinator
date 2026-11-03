@@ -244,13 +244,32 @@ func (thc *TargetHashCache) SourceFileLabels() map[string]bool {
 	return sourceFiles
 }
 
-// splitHashKey splits a "<label>\x00<configuration>" cache key.
-func splitHashKey(key string) (label, configuration string, ok bool) {
-	idx := strings.IndexByte(key, '\x00')
-	if idx < 0 {
-		return "", "", false
+// extractDependencyHashes copies only the requested labels' computed SHA-256
+// hashes. Filtering before copying avoids materializing the entire cache in
+// both raw and hex form when persisting a small set of dependency hashes.
+func (thc *TargetHashCache) extractDependencyHashes(wanted map[string]bool) map[string]map[string]string {
+	hashes := make(map[string]map[string]string)
+	thc.cacheLock.Lock()
+	defer thc.cacheLock.Unlock()
+	for label, configurations := range thc.cache {
+		labelString := label.String()
+		if !wanted[labelString] {
+			continue
+		}
+		for configuration, entry := range configurations {
+			entry.hashLock.Lock()
+			// Missing-file sentinels and uncomputed entries must not be persisted:
+			// seeds require SHA-256-sized hashes, and extraction must not compute any.
+			if len(entry.hash) == sha256.Size {
+				if hashes[labelString] == nil {
+					hashes[labelString] = make(map[string]string)
+				}
+				hashes[labelString][configuration.String()] = hex.EncodeToString(entry.hash)
+			}
+			entry.hashLock.Unlock()
+		}
 	}
-	return key[:idx], key[idx+1:], true
+	return hashes
 }
 
 // RestoreHashes populates the cache with pre-computed hashes and freezes the cache.
