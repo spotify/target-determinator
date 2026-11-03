@@ -380,3 +380,79 @@ func TestBuildProbePatternUnquotableWord(t *testing.T) {
 		t.Fatalf("unquotable word returned pattern %q, error %v", got, err)
 	}
 }
+
+func TestValidateCertainFallback(t *testing.T) {
+	for _, tc := range []struct {
+		mode              string
+		seedFile, seedSha bool
+		wantErr           bool
+	}{
+		{mode: "run"},
+		{mode: "skip", seedFile: true, seedSha: true},
+		{mode: "skip", seedSha: true, wantErr: true},
+		{mode: "only", seedSha: true},
+		{mode: "only", seedFile: true, seedSha: true, wantErr: true},
+		{mode: "only", wantErr: true},
+		{mode: "bogus", wantErr: true},
+	} {
+		err := validateCertainFallback(tc.mode, tc.seedFile, tc.seedSha)
+		if (err != nil) != tc.wantErr {
+			t.Errorf("validateCertainFallback(%q, %v, %v) = %v, wantErr %v", tc.mode, tc.seedFile, tc.seedSha, err, tc.wantErr)
+		}
+	}
+}
+
+func TestPrecheckFallback(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	dir := t.TempDir()
+	git := func(args ...string) string {
+		cmd := exec.Command("git", append([]string{"-c", "user.name=t", "-c", "user.email=t@t"}, args...)...)
+		cmd.Dir = dir
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	commit := func(file string) string {
+		if err := os.MkdirAll(filepath.Join(dir, filepath.Dir(file)), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, file), []byte(file), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		git("add", ".")
+		git("commit", "-qm", file)
+		return git("rev-parse", "HEAD")
+	}
+	git("init", "-q")
+	base := commit("a/BUILD.bazel")
+	javaChange := commit("a/A.java")
+	bzlChange := commit("a/defs.bzl")
+	patternChange := commit("tools/etna.yaml")
+	fingerprintChange := commit("rules/fp.txt")
+
+	fingerprints := []pkg.RuleClassFingerprint{{Files: []string{"rules/fp.txt"}}}
+	patterns := []string{"tools/etna.yaml"}
+	for _, tc := range []struct {
+		name        string
+		from, to    string
+		wantCertain bool
+		wantCode    string
+	}{
+		{name: "plain source change", from: base, to: javaChange},
+		{name: "starlark change", from: javaChange, to: bzlChange, wantCertain: true, wantCode: "unsafe_file_change"},
+		{name: "trigger pattern", from: bzlChange, to: patternChange, wantCertain: true, wantCode: "unsafe_file_change"},
+		{name: "fingerprint file", from: patternChange, to: fingerprintChange, wantCertain: true, wantCode: "rule_fingerprint_change"},
+		{name: "unknown commit", from: "0000000000000000000000000000000000000000", to: base},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			code, _, certain := precheckFallback(dir, tc.from, tc.to, fingerprints, patterns)
+			if certain != tc.wantCertain || code != tc.wantCode {
+				t.Errorf("precheckFallback = (%q, %v), want (%q, %v)", code, certain, tc.wantCode, tc.wantCertain)
+			}
+		})
+	}
+}

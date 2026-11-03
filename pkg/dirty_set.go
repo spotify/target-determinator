@@ -81,7 +81,7 @@ func ComputeDirtySet(
 	packagesExistAtTarget func(pkgs []string) (map[string]bool, error),
 ) *DirtySetResult {
 	// First pass: fallback triggers.
-	if code, reason, ok := findFallbackTrigger(changedFiles, ruleClassFingerprintFiles, fallbackTriggerPatterns); ok {
+	if code, reason, ok := FindFallbackTrigger(changedFiles, ruleClassFingerprintFiles, fallbackTriggerPatterns); ok {
 		return fallbackResult(code, reason)
 	}
 
@@ -121,9 +121,10 @@ func fallbackResult(code, reason string) *DirtySetResult {
 	}
 }
 
-// findFallbackTrigger reports the first changed file that forces a full
-// rehash, with its fallback code and reason.
-func findFallbackTrigger(
+// FindFallbackTrigger reports the first changed file that forces a full
+// rehash, with its fallback code and reason. It needs no seed data, so callers
+// can use it to decide on a fallback before any hashing starts.
+func FindFallbackTrigger(
 	changedFiles map[string]string,
 	ruleClassFingerprintFiles map[string]bool,
 	fallbackTriggerPatterns []string,
