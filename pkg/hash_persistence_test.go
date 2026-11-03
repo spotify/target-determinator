@@ -18,6 +18,7 @@ import (
 	"github.com/bazel-contrib/target-determinator/third_party/protobuf/bazel/analysis"
 	"github.com/bazel-contrib/target-determinator/third_party/protobuf/bazel/build"
 	gazelle_label "github.com/bazelbuild/bazel-gazelle/label"
+	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -651,6 +652,108 @@ func TestJSONFieldsRejectsUnsupportedFields(t *testing.T) {
 				}
 			}()
 			jsonFields(typ)
+		})
+	}
+}
+
+func TestExtractDependencyHashesFiltersCache(t *testing.T) {
+	source := mustParseLabel("//pkg:source.java")
+	configuration := NormalizeConfiguration("")
+	context := map[gazelle_label.Label]map[Configuration]*analysis.ConfiguredTarget{
+		source: {configuration: {Target: &build.Target{Type: build.Target_SOURCE_FILE.Enum()}}},
+	}
+	cache := NewTargetHashCache(context, &Normalizer{}, "release 8.0.0", true, nil)
+	first := bytes.Repeat([]byte{0x11}, sha256.Size)
+	second := bytes.Repeat([]byte{0x22}, sha256.Size)
+	require.NoError(t, cache.SeedHashes(map[string][]byte{
+		"//pkg:dependency\x00cfg1": first,
+		"//pkg:dependency\x00cfg2": second,
+		"//pkg:source.java\x00":    first,
+		"//pkg:matching\x00":       first,
+		"//pkg:unreferenced\x00":   first,
+		"//pkg:missing\x00":        {},
+		"//pkg:invalid\x00":        {0x33},
+	}))
+	targetHashes := map[string]map[string]string{"//pkg:matching": {"": hex.EncodeToString(first)}}
+	edges := map[string][]string{
+		"//pkg:matching": {"//pkg:dependency", "//pkg:source.java", "//pkg:missing", "//pkg:invalid", "//pkg:uncached"},
+	}
+	require.Equal(t, map[string]map[string]string{
+		"//pkg:dependency": {"cfg1": hex.EncodeToString(first), "cfg2": hex.EncodeToString(second)},
+	}, ExtractDependencyHashes(targetHashes, edges, cache))
+	// Extraction must not compute hashes for uncached dependencies or mutate
+	// the cache: those labels may not be available in the current worktree.
+	require.Len(t, cache.cache, 6)
+	require.Equal(t, first, cache.cache[mustParseLabel("//pkg:dependency")][NormalizeConfiguration("cfg1")].hash)
+}
+
+func TestExtractDependencyHashesCanonicalLabels(t *testing.T) {
+	cache := NewTargetHashCache(nil, &Normalizer{}, "release 8.0.0", true, nil)
+	hash := bytes.Repeat([]byte{0x11}, sha256.Size)
+	require.NoError(t, cache.SeedHashes(map[string][]byte{
+		"//pkg\x00":                            hash,
+		"@external//pkg:dependency\x00":        hash,
+		"@@canonical+repo//pkg:dependency\x00": hash,
+	}))
+	cases := []struct {
+		name  string
+		edges map[string][]string
+		want  map[string]map[string]string
+	}{
+		{
+			name:  "canonical spellings",
+			edges: map[string][]string{"//app:consumer": {"//pkg", "@external//pkg:dependency", "@@canonical+repo//pkg:dependency"}},
+			want: map[string]map[string]string{
+				"//pkg":                            {"": hex.EncodeToString(hash)},
+				"@external//pkg:dependency":        {"": hex.EncodeToString(hash)},
+				"@@canonical+repo//pkg:dependency": {"": hex.EncodeToString(hash)},
+			},
+		},
+		{
+			name:  "aliases and invalid labels do not match cache keys",
+			edges: map[string][]string{"//app:consumer": {"//pkg:pkg", "@//pkg", "//invalid:label:syntax"}},
+			want:  map[string]map[string]string{},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			require.Equal(t, tc.want, ExtractDependencyHashes(nil, tc.edges, cache))
+		})
+	}
+}
+
+func BenchmarkExtractDependencyHashes(b *testing.B) {
+	for _, count := range []int{10000, 100000} {
+		b.Run(fmt.Sprintf("cached_%d", count), func(b *testing.B) {
+			configuration := NormalizeConfiguration("")
+			context := make(map[gazelle_label.Label]map[Configuration]*analysis.ConfiguredTarget, count)
+			cache := NewTargetHashCache(context, &Normalizer{}, "release 8.0.0", true, nil)
+			edges := map[string][]string{"//app:consumer": make([]string, 0, count)}
+			hash := sha256.Sum256([]byte("benchmark"))
+			for i := 0; i < count; i++ {
+				label := mustParseLabel(fmt.Sprintf("//external/dependency/package:file_%08d", i))
+				kind := build.Target_SOURCE_FILE
+				// Most cached hashes are source files; only 1% need to be persisted
+				// as dependency hashes. Include all labels in the graph so source
+				// filtering, rather than graph reachability, excludes them.
+				if i%100 == 0 {
+					kind = build.Target_RULE
+				}
+				context[label] = map[Configuration]*analysis.ConfiguredTarget{
+					configuration: {Target: &build.Target{Type: kind.Enum()}},
+				}
+				cache.cache[label] = map[Configuration]*cacheEntry{configuration: {hash: hash[:]}}
+				edges["//app:consumer"] = append(edges["//app:consumer"], label.String())
+			}
+			targets := map[string]map[string]string{}
+			b.ReportAllocs()
+			b.ResetTimer()
+			var got map[string]map[string]string
+			for i := 0; i < b.N; i++ {
+				got = ExtractDependencyHashes(targets, edges, cache)
+			}
+			b.StopTimer()
+			require.Len(b, got, count/100)
 		})
 	}
 }

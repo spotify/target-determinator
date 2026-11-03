@@ -244,13 +244,33 @@ func (thc *TargetHashCache) SourceFileLabels() map[string]bool {
 	return sourceFiles
 }
 
-// splitHashKey splits a "<label>\x00<configuration>" cache key.
-func splitHashKey(key string) (label, configuration string, ok bool) {
-	idx := strings.IndexByte(key, '\x00')
-	if idx < 0 {
-		return "", "", false
+// extractDependencyHashes copies only the requested labels' computed SHA-256
+// hashes. Filtering before copying avoids materializing the entire cache in
+// both raw and hex form when persisting a small set of dependency hashes.
+// The caller must finish hashing and all other cache mutations before calling.
+// This method reads the completed cache without locking.
+func (thc *TargetHashCache) extractDependencyHashes(wanted map[string]bool) map[string]map[string]string {
+	hashes := make(map[string]map[string]string)
+	for labelString := range wanted {
+		// Graph labels already use the cache's canonical spelling. Require
+		// an exact round trip so aliases do not select previously excluded
+		// hashes or change the labels written to the seed.
+		label, err := gazelle_label.Parse(labelString)
+		if err != nil || label.String() != labelString {
+			continue
+		}
+		for configuration, entry := range thc.cache[label] {
+			// Missing-file sentinels and uncomputed entries must not be persisted:
+			// seeds require SHA-256-sized hashes, and extraction must not compute any.
+			if len(entry.hash) == sha256.Size {
+				if hashes[labelString] == nil {
+					hashes[labelString] = make(map[string]string)
+				}
+				hashes[labelString][configuration.String()] = hex.EncodeToString(entry.hash)
+			}
+		}
 	}
-	return key[:idx], key[idx+1:], true
+	return hashes
 }
 
 // RestoreHashes populates the cache with pre-computed hashes and freezes the cache.
