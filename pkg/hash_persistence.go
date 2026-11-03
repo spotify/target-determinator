@@ -255,6 +255,9 @@ func persistHashes(filePath string, gitCommitSha string, queryResults *QueryResu
 // Source files are deliberately excluded. The git diff already says whether
 // a file changed, so hashing one to rediscover that is redundant, and they
 // outnumber the labels that do need a hash by more than twenty to one.
+//
+// The caller must finish hashing and all other cache mutations before calling;
+// extraction reads the completed cache without locking.
 func ExtractDependencyHashes(targetHashes map[string]map[string]string, edges map[string][]string, cache *TargetHashCache) map[string]map[string]string {
 	sourceFiles := cache.SourceFileLabels()
 
