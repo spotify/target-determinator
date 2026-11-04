@@ -3,10 +3,12 @@ package pkg
 import (
 	"bytes"
 	"crypto/sha256"
+	"encoding"
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"log"
 	"os"
@@ -108,6 +110,12 @@ func isConfiguredRuleInputsSupported(releaseString string) bool {
 // In the future we may pre-cache file hashes to avoid this hazard (and to allow more efficient
 // use of threadpools when hashing files).
 type TargetHashCache struct {
+	// Query-only SHA-256 states after the rule's own attributes, before dependencies.
+	// Written during metadata loading and read-only during concurrent hashing.
+	ruleAttributeHashStates map[*build.Rule][]byte
+	// Attributes discarded during loading cannot be used for difference explanations.
+	attributesDiscarded bool
+
 	context                                  map[gazelle_label.Label]map[Configuration]*analysis.ConfiguredTarget
 	fileHashCache                            *fileHashCache
 	bazelRelease                             string
@@ -244,13 +252,33 @@ func (thc *TargetHashCache) SourceFileLabels() map[string]bool {
 	return sourceFiles
 }
 
-// splitHashKey splits a "<label>\x00<configuration>" cache key.
-func splitHashKey(key string) (label, configuration string, ok bool) {
-	idx := strings.IndexByte(key, '\x00')
-	if idx < 0 {
-		return "", "", false
+// extractDependencyHashes copies only the requested labels' computed SHA-256
+// hashes. Filtering before copying avoids materializing the entire cache in
+// both raw and hex form when persisting a small set of dependency hashes.
+// The caller must finish hashing and all other cache mutations before calling.
+// This method reads the completed cache without locking.
+func (thc *TargetHashCache) extractDependencyHashes(wanted map[string]bool) map[string]map[string]string {
+	hashes := make(map[string]map[string]string)
+	for labelString := range wanted {
+		// Graph labels already use the cache's canonical spelling. Require
+		// an exact round trip so aliases do not select previously excluded
+		// hashes or change the labels written to the seed.
+		label, err := gazelle_label.Parse(labelString)
+		if err != nil || label.String() != labelString {
+			continue
+		}
+		for configuration, entry := range thc.cache[label] {
+			// Missing-file sentinels and uncomputed entries must not be persisted:
+			// seeds require SHA-256-sized hashes, and extraction must not compute any.
+			if len(entry.hash) == sha256.Size {
+				if hashes[labelString] == nil {
+					hashes[labelString] = make(map[string]string)
+				}
+				hashes[labelString][configuration.String()] = hex.EncodeToString(entry.hash)
+			}
+		}
 	}
-	return key[:idx], key[idx+1:], true
+	return hashes
 }
 
 // RestoreHashes populates the cache with pre-computed hashes and freezes the cache.
@@ -323,6 +351,9 @@ func (d Difference) String() string {
 
 // WalkDiffs accumulates the differences of a LabelAndConfiguration before and after a change.
 func WalkDiffs(before *TargetHashCache, after *TargetHashCache, labelAndConfiguration LabelAndConfiguration) ([]Difference, error) {
+	if before.attributesDiscarded || after.attributesDiscarded {
+		return nil, fmt.Errorf("difference explanations require metadata loaded with full attributes")
+	}
 	beforeHash, err := before.Hash(labelAndConfiguration)
 	if err != nil {
 		return nil, err
@@ -599,6 +630,8 @@ func hashTarget(thc *TargetHashCache, labelAndConfiguration LabelAndConfiguratio
 	if !ok {
 		return nil, fmt.Errorf("label %s configuration %s not found in contxt: %w", label, configuration, labelNotFound)
 	}
+	// Handle opaque targets before hashRule: prehashRuleAttributes discards their
+	// attributes without saving a state because only their identity contributes.
 	if _, opaque := thc.opaqueInputRepositories[label.Repo]; label.Repo != "" && opaque {
 		hasher := sha256.New()
 		hasher.Write([]byte("target-determinator:opaque-input:v1"))
@@ -673,8 +706,56 @@ func hashTarget(thc *TargetHashCache, labelAndConfiguration LabelAndConfiguratio
 	}
 }
 
+// ruleHasher preserves the unfinished SHA-256 computation, so dependency
+// bytes are appended exactly as before rather than hashing a hash of attributes.
+func ruleHasher(thc *TargetHashCache, rule *build.Rule, configuration *analysis.Configuration) (hash.Hash, error) {
+	if state, ok := thc.ruleAttributeHashStates[rule]; ok {
+		hasher := sha256.New()
+		if err := hasher.(encoding.BinaryUnmarshaler).UnmarshalBinary(state); err != nil {
+			return nil, err
+		}
+		return hasher, nil
+	}
+	if thc.attributesDiscarded {
+		// Opaque targets return from hashTarget before reaching this function.
+		return nil, fmt.Errorf("missing precomputed attribute hash state for rule %q after attributes were discarded", rule.GetName())
+	}
+	return hashRuleOwnAttributes(thc, rule, configuration)
+}
+
+func (thc *TargetHashCache) prehashRuleAttributes(rule *build.Rule) error {
+	// Query metadata has no configurations. Opaque rules contribute their identity
+	// only via hashTarget's opaque branch, which returns before hashRule. Their
+	// attributes can therefore be dropped without computing a prefix.
+	label, err := thc.normalizer.ParseCanonicalLabel(rule.GetName())
+	if err != nil {
+		return err
+	}
+	if _, opaque := thc.opaqueInputRepositories[label.Repo]; label.Repo != "" && opaque {
+		rule.Attribute = nil
+		return nil
+	}
+	// The regular path normalizes during ParseCqueryResult, then redacts and
+	// normalizes again in AttributeForSerialization. Preserve that sequence.
+	normalizeRuleAttributes(rule, thc.normalizer)
+	hasher, err := hashRuleOwnAttributes(thc, rule, nil)
+	if err != nil {
+		return err
+	}
+	state, err := hasher.(encoding.BinaryMarshaler).MarshalBinary()
+	if err != nil {
+		return err
+	}
+	if thc.ruleAttributeHashStates == nil {
+		thc.ruleAttributeHashStates = make(map[*build.Rule][]byte)
+	}
+	thc.ruleAttributeHashStates[rule] = state
+	rule.Attribute = nil
+	return nil
+}
+
 // If this function changes, so should WalkDiffs.
-func hashRule(thc *TargetHashCache, rule *build.Rule, configuration *analysis.Configuration) ([]byte, error) {
+func hashRuleOwnAttributes(thc *TargetHashCache, rule *build.Rule, configuration *analysis.Configuration) (hash.Hash, error) {
 	hasher := sha256.New()
 	// Mix in the Bazel version, because Bazel versions changes may cause differences to how rules
 	// are evaluated even if the rules themselves haven't changed.
@@ -706,6 +787,16 @@ func hashRule(thc *TargetHashCache, rule *build.Rule, configuration *analysis.Co
 		}
 
 		hasher.Write(protoBytes)
+	}
+
+	return hasher, nil
+}
+
+// If this function changes, so should WalkDiffs.
+func hashRule(thc *TargetHashCache, rule *build.Rule, configuration *analysis.Configuration) ([]byte, error) {
+	hasher, err := ruleHasher(thc, rule, configuration)
+	if err != nil {
+		return nil, err
 	}
 
 	ownConfiguration := NormalizeConfiguration(configuration.GetChecksum())

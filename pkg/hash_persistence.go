@@ -257,6 +257,9 @@ func BuildPersistedHashData(gitCommitSha string, queryResults *QueryResults, con
 // Source files are deliberately excluded. The git diff already says whether
 // a file changed, so hashing one to rediscover that is redundant, and they
 // outnumber the labels that do need a hash by more than twenty to one.
+//
+// The caller must finish hashing and all other cache mutations before calling;
+// extraction reads the completed cache without locking.
 func ExtractDependencyHashes(targetHashes map[string]map[string]string, edges map[string][]string, cache *TargetHashCache) map[string]map[string]string {
 	sourceFiles := cache.SourceFileLabels()
 
@@ -282,29 +285,7 @@ func ExtractDependencyHashes(targetHashes map[string]map[string]string, edges ma
 		return nil
 	}
 
-	dependencyHashes := make(map[string]map[string]string)
-	for key, hashHex := range cache.ExtractHexHashes() {
-		label, configuration, ok := splitHashKey(key)
-		if !ok || !wanted[label] {
-			continue
-		}
-		// The cache yields a zero-length sentinel rather than a hash for
-		// labels whose file does not exist or is a directory. Persisting
-		// one would fail seed validation, which requires every hash to be
-		// sha256-sized, and cause the whole seed to be rejected. Omitting
-		// the label instead just makes incremental hashing treat it as
-		// changed, which is the safe direction.
-		if len(hashHex) != hex.EncodedLen(sha256.Size) {
-			continue
-		}
-		configs := dependencyHashes[label]
-		if configs == nil {
-			configs = make(map[string]string)
-			dependencyHashes[label] = configs
-		}
-		configs[configuration] = hashHex
-	}
-	return dependencyHashes
+	return cache.extractDependencyHashes(wanted)
 }
 
 // WritePersistedData writes a PersistedHashData struct directly to a JSON file.

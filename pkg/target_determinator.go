@@ -365,6 +365,20 @@ func fullyProcessRevision(context *Context, rev LabelledGitRev, targets TargetsL
 // empty target-set, but may contain other useful information (e.g. the bazel release version).
 // Checking for nil-ness of the error is the true arbiter for whether the entire load was successful.
 func LoadIncompleteMetadata(context *Context, rev LabelledGitRev, targets TargetsList) (*QueryResults, func(), error) {
+	return loadIncompleteMetadata(context, rev, targets, false)
+}
+
+// LoadMetadataForHashing loads targets for hash computation and persistence.
+// With the query backend, rule attributes are consumed into SHA-256 states as
+// they are read and then discarded. The returned metadata must not be used for
+// attribute comparisons or diff explanations. Dependency edges remain available.
+// Call LoadIncompleteMetadata when full attributes are needed.
+// Cquery and requests with IncludeDifferences retain their full metadata.
+func LoadMetadataForHashing(context *Context, rev LabelledGitRev, targets TargetsList) (*QueryResults, func(), error) {
+	return loadIncompleteMetadata(context, rev, targets, !context.IncludeDifferences)
+}
+
+func loadIncompleteMetadata(context *Context, rev LabelledGitRev, targets TargetsList, hashOnly bool) (*QueryResults, func(), error) {
 	// Create a temporary context to allow the workspace path to point to a git worktree if necessary.
 	context = &Context{
 		WorkspacePath:                          context.WorkspacePath,
@@ -413,7 +427,7 @@ func LoadIncompleteMetadata(context *Context, rev LabelledGitRev, targets Target
 		var queryInfoBeforeClear *QueryResults
 		if context.CompareQueriesAroundAnalysisCacheClear {
 			var err error
-			queryInfoBeforeClear, err = doQueryDeps(context, targets)
+			queryInfoBeforeClear, err = doQueryDeps(context, targets, false)
 			if err != nil {
 				return queryInfoBeforeClear, cleanupFunc, fmt.Errorf("failed to query[before] at %s in %v: %w", rev, context.WorkspacePath, err)
 			}
@@ -425,7 +439,7 @@ func LoadIncompleteMetadata(context *Context, rev LabelledGitRev, targets Target
 			return nil, cleanupFunc, err
 		}
 
-		queryInfo, err := doQueryDeps(context, targets)
+		queryInfo, err := doQueryDeps(context, targets, false)
 		if err != nil {
 			return queryInfo, cleanupFunc, fmt.Errorf("failed to query at %s in %v: %w", rev, context.WorkspacePath, err)
 		}
@@ -442,7 +456,7 @@ func LoadIncompleteMetadata(context *Context, rev LabelledGitRev, targets Target
 		return queryInfo, cleanupFunc, nil
 	}
 
-	queryInfo, err := doQueryDeps(context, targets)
+	queryInfo, err := doQueryDeps(context, targets, hashOnly)
 	if err != nil {
 		return queryInfo, cleanupFunc, fmt.Errorf("failed to query at %s in %v: %w", rev, context.WorkspacePath, err)
 	}
@@ -847,9 +861,7 @@ func retrieveRepoMapping(workspacePath string, bazelCmd BazelCmd) (map[string]st
 func NormalizeConfiguredTarget(target *analysis.ConfiguredTarget, n *Normalizer) {
 	if target.GetTarget().GetRule() != nil {
 		rule := target.GetTarget().GetRule()
-		for _, attr := range rule.GetAttribute() {
-			n.NormalizeAttribute(attr)
-		}
+		normalizeRuleAttributes(rule, n)
 
 		for idx, input := range rule.GetConfiguredRuleInput() {
 			lbl, err := n.ParseCanonicalLabel(*input.Label)
@@ -861,10 +873,18 @@ func NormalizeConfiguredTarget(target *analysis.ConfiguredTarget, n *Normalizer)
 	}
 }
 
+// normalizeRuleAttributes is shared by full metadata loading and hash-only
+// preprocessing so both feed identical attributes to the hash calculation.
+func normalizeRuleAttributes(rule *build.Rule, n *Normalizer) {
+	for _, attr := range rule.GetAttribute() {
+		n.NormalizeAttribute(attr)
+	}
+}
+
 // Note that a non-nil QueryResults may be returned even in the error case, which will have an
 // empty target-set, but may contain other useful information (e.g. the bazel release version).
 // Checking for nil-ness of the error is the true arbiter for whether the entire query was successful.
-func doQueryDeps(context *Context, targets TargetsList) (*QueryResults, error) {
+func doQueryDeps(context *Context, targets TargetsList, hashOnly bool) (*QueryResults, error) {
 	bazelRelease, err := BazelRelease(context.WorkspacePath, context.BazelCmd)
 	if err != nil {
 		return nil, fmt.Errorf("failed to resolve the bazel release: %w", err)
@@ -897,7 +917,7 @@ func doQueryDeps(context *Context, targets TargetsList) (*QueryResults, error) {
 	}
 
 	if context.QueryBackend == "query" {
-		return doQueryDepsQueryMode(context, targets, &normalizer, bazelRelease, ruleClassFingerprintDigests)
+		return doQueryDepsQueryMode(context, targets, &normalizer, bazelRelease, ruleClassFingerprintDigests, hashOnly)
 	}
 
 	// Work around https://github.com/bazelbuild/bazel/issues/21010
@@ -1000,9 +1020,20 @@ func doQueryDeps(context *Context, targets TargetsList) (*QueryResults, error) {
 	return queryResults, nil
 }
 
-func doQueryDepsQueryMode(context *Context, targets TargetsList, normalizer *Normalizer, bazelRelease string, ruleClassFingerprintDigests []RuleClassFingerprintDigests) (*QueryResults, error) {
+func doQueryDepsQueryMode(context *Context, targets TargetsList, normalizer *Normalizer, bazelRelease string, ruleClassFingerprintDigests []RuleClassFingerprintDigests, hashOnly bool) (*QueryResults, error) {
 	depsPattern := fmt.Sprintf("deps(%s)", targets.String())
-	transitiveResult, err := runToQueryResult(context, depsPattern)
+	cache := NewTargetHashCache(nil, normalizer, bazelRelease, true, ruleClassFingerprintDigests, context.OpaqueInputRepositories...)
+	cache.attributesDiscarded = hashOnly
+	var consume func(*build.Target) error
+	if hashOnly {
+		consume = func(target *build.Target) error {
+			if rule := target.GetRule(); target.GetType() == build.Target_RULE && rule != nil {
+				return cache.prehashRuleAttributes(rule)
+			}
+			return nil
+		}
+	}
+	transitiveResult, err := runToQueryResult(context, depsPattern, consume)
 	if err != nil {
 		retErr := fmt.Errorf("failed to query %v: %w", depsPattern, err)
 		return &QueryResults{
@@ -1011,7 +1042,7 @@ func doQueryDepsQueryMode(context *Context, targets TargetsList, normalizer *Nor
 				labelsToConfigurations: nil,
 			},
 			TransitiveConfiguredTargets: nil,
-			TargetHashCache:             NewTargetHashCache(nil, normalizer, bazelRelease, true, ruleClassFingerprintDigests, context.OpaqueInputRepositories...),
+			TargetHashCache:             cache,
 			BazelRelease:                bazelRelease,
 			QueryError:                  retErr,
 		}, retErr
@@ -1049,10 +1080,12 @@ func doQueryDepsQueryMode(context *Context, targets TargetsList, normalizer *Nor
 		labelsToConfigurations: processedLabelsToConfigurations,
 	}
 
+	// Attach the indexed graph before publishing the cache to hashing workers.
+	cache.context = transitiveConfiguredTargets
 	queryResults := &QueryResults{
 		MatchingTargets:             matchingTargets,
 		TransitiveConfiguredTargets: transitiveConfiguredTargets,
-		TargetHashCache:             NewTargetHashCache(transitiveConfiguredTargets, normalizer, bazelRelease, true, ruleClassFingerprintDigests, context.OpaqueInputRepositories...),
+		TargetHashCache:             cache,
 		BazelRelease:                bazelRelease,
 		QueryError:                  nil,
 		configurations:              map[Configuration]singleConfigurationOutput{},
@@ -1157,7 +1190,7 @@ func truncateForLog(pattern string) string {
 	return pattern[:maxLogged] + fmt.Sprintf("... (%d bytes total)", len(pattern))
 }
 
-func runToQueryResult(context *Context, pattern string) ([]*analysis.ConfiguredTarget, error) {
+func runToQueryResult(context *Context, pattern string, consume func(*build.Target) error) ([]*analysis.ConfiguredTarget, error) {
 	log.Printf("Running query on %s", truncateForLog(pattern))
 
 	queryOutputFile, err := os.CreateTemp("", "target-determinator-query-*.proto")
@@ -1205,6 +1238,11 @@ func runToQueryResult(context *Context, pattern string) ([]*analysis.ConfiguredT
 			break
 		} else if err != nil {
 			return nil, fmt.Errorf("failed to unmarshal streamed query output: %w", err)
+		}
+		if consume != nil {
+			if err := consume(&target); err != nil {
+				return nil, fmt.Errorf("failed to consume query target: %w", err)
+			}
 		}
 		targets = append(targets, &analysis.ConfiguredTarget{
 			Target:        &target,

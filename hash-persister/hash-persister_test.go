@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -10,6 +11,8 @@ import (
 	"testing"
 
 	"github.com/bazel-contrib/target-determinator/pkg"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestValidateSeed(t *testing.T) {
@@ -378,5 +381,73 @@ func TestBuildProbePatternUnquotableWord(t *testing.T) {
 	got, err := buildProbePattern([]string{`//both'"`})
 	if err == nil || got != "" {
 		t.Fatalf("unquotable word returned pattern %q, error %v", got, err)
+	}
+}
+
+func TestValidateSeedHashes(t *testing.T) {
+	for _, dependency := range []bool{false, true} {
+		for _, hash := range []string{strings.Repeat("0a", 32), strings.Repeat("AF", 32), "", "0", "00", strings.Repeat("00", 33), strings.Repeat("gg", 32)} {
+			t.Run(fmt.Sprintf("dependency_%t/hash_%s", dependency, hash), func(t *testing.T) {
+				data := &pkg.PersistedHashData{TargetHashes: map[string]map[string]string{}}
+				hashes := map[string]map[string]string{"//pkg:target": {"cfg1": strings.Repeat("01", 32), "cfg2": hash}}
+				if dependency {
+					data.DependencyHashes = hashes
+				} else {
+					data.TargetHashes = hashes
+				}
+				wantValid := hash == strings.Repeat("0a", 32) || hash == strings.Repeat("AF", 32)
+				if err := validateSeedHashes(data); (err == nil) != wantValid {
+					t.Fatalf("validation error = %v, want valid = %t", err, wantValid)
+				}
+				if _, err := reusableSeedHashes(data, nil); (err == nil) != wantValid {
+					t.Fatalf("seeding error = %v, want valid = %t", err, wantValid)
+				}
+			})
+		}
+	}
+	if err := validateSeedHashes(&pkg.PersistedHashData{}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestReusableSeedHashesCopiesHashesAndSkipsDirtyLabels(t *testing.T) {
+	data := &pkg.PersistedHashData{
+		TargetHashes: map[string]map[string]string{
+			"//pkg:clean": {"cfg1": strings.Repeat("01", 32), "cfg2": strings.Repeat("02", 32)},
+			"//pkg:dirty": {"cfg": "invalid"},
+		},
+		DependencyHashes: map[string]map[string]string{
+			"//dep:clean": {"cfg": strings.Repeat("03", 32)},
+			"//dep:dirty": {"cfg": "invalid"},
+		},
+	}
+	hashes, err := reusableSeedHashes(data, map[string]bool{"//pkg:dirty": true, "//dep:dirty": true})
+	require.NoError(t, err)
+	want := map[string][]byte{
+		"//pkg:clean\x00cfg1": []byte(strings.Repeat("\x01", 32)),
+		"//pkg:clean\x00cfg2": []byte(strings.Repeat("\x02", 32)),
+		"//dep:clean\x00cfg":  []byte(strings.Repeat("\x03", 32)),
+	}
+	require.Equal(t, want, hashes)
+	hashes["//pkg:clean\x00cfg1"][0] = 0xff
+	assert.Equal(t, want["//pkg:clean\x00cfg2"], hashes["//pkg:clean\x00cfg2"])
+	assert.Equal(t, want["//dep:clean\x00cfg"], hashes["//dep:clean\x00cfg"])
+}
+
+func BenchmarkValidateSeed(b *testing.B) {
+	for _, count := range []int{100000, 500000} {
+		b.Run(fmt.Sprintf("hashes_%d", count), func(b *testing.B) {
+			data := &pkg.PersistedHashData{FormatVersion: pkg.CurrentPersistedHashFormatVersion, GitCommitSha: "seed", SeedCompatibilityFingerprint: "fingerprint", TargetEdges: map[string][]string{}, TargetHashes: make(map[string]map[string]string, count)}
+			for i := 0; i < count; i++ {
+				data.TargetHashes[fmt.Sprintf("//representative/package_%06d:target", i)] = map[string]string{"": strings.Repeat("01", 32)}
+			}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if reason := validateSeed(data, "seed", "fingerprint"); reason != nil {
+					b.Fatal(reason)
+				}
+			}
+		})
 	}
 }
