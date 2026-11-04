@@ -174,7 +174,7 @@ func runFull(cfg *config) (int, error) {
 	log.Printf("Computing hashes for commit %s (full mode)", cfg.CommitSha)
 
 	phaseStart := time.Now()
-	queryResults, cleanup, err := pkg.LoadIncompleteMetadata(cfg.Context, commitRev, cfg.Targets)
+	queryResults, cleanup, err := pkg.LoadMetadataForHashing(cfg.Context, commitRev, cfg.Targets)
 	if err != nil {
 		cleanup()
 		return 0, fmt.Errorf("failed to load metadata for commit %s: %w", cfg.CommitSha, err)
