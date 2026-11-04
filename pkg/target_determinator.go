@@ -1241,7 +1241,7 @@ func runToQueryResult(context *Context, pattern string, consume func(*build.Targ
 		}
 		if consume != nil {
 			if err := consume(&target); err != nil {
-				return nil, fmt.Errorf("failed to prehash query target: %w", err)
+				return nil, fmt.Errorf("failed to consume query target: %w", err)
 			}
 		}
 		targets = append(targets, &analysis.ConfiguredTarget{

@@ -219,12 +219,30 @@ func TestWalkDiffsRequiresFullAttributes(t *testing.T) {
 	}
 }
 
-func TestPrehashOpaqueRuleDoesNotReadItsAttributes(t *testing.T) {
+func TestHashOnlyMetadataRejectsClonedRuleWithoutSavedState(t *testing.T) {
+	metadata := loadCompactionMetadata(t, metadataLoadingCase{backend: "query"}, false)
+	key := LabelAndConfiguration{Label: label.New("", "pkg", "root"), Configuration: NormalizeConfiguration("")}
+	target := metadata.forHashing.TransitiveConfiguredTargets[key.Label][key.Configuration].GetTarget()
+	original := target.GetRule()
+	require.Nil(t, original.Attribute)
+	// Cloning preserves the rule's contents but loses the pointer identity
+	// used to associate it with its precomputed state.
+	target.Rule = proto.Clone(original).(*build.Rule)
+	require.NotSame(t, original, target.Rule)
+
+	hash, err := metadata.forHashing.TargetHashCache.Hash(key)
+	require.ErrorContains(t, err, "missing precomputed attribute hash state")
+	require.ErrorContains(t, err, "//pkg:root")
+	require.Nil(t, hash)
+}
+
+func TestPrehashSkipsAttributeHashingForOpaqueRules(t *testing.T) {
 	n := &Normalizer{Mapping: map[string]string{"short": "canonical"}}
 	rule := &build.Rule{Name: proto.String("@short//dep:dep"), Attribute: []*build.Attribute{{}}}
 	cache := NewTargetHashCache(nil, n, "release 9.2.0", true, nil, "short")
 	require.NoError(t, cache.prehashRuleAttributes(rule))
 	require.Nil(t, rule.Attribute)
+	require.Empty(t, cache.ruleAttributeHashStates)
 }
 
 func TestHashOnlyMetadataDoesNotHashDependencyFilesEarly(t *testing.T) {

@@ -630,6 +630,8 @@ func hashTarget(thc *TargetHashCache, labelAndConfiguration LabelAndConfiguratio
 	if !ok {
 		return nil, fmt.Errorf("label %s configuration %s not found in contxt: %w", label, configuration, labelNotFound)
 	}
+	// Handle opaque targets before hashRule: prehashRuleAttributes discards their
+	// attributes without saving a state because only their identity contributes.
 	if _, opaque := thc.opaqueInputRepositories[label.Repo]; label.Repo != "" && opaque {
 		hasher := sha256.New()
 		hasher.Write([]byte("target-determinator:opaque-input:v1"))
@@ -714,12 +716,17 @@ func ruleHasher(thc *TargetHashCache, rule *build.Rule, configuration *analysis.
 		}
 		return hasher, nil
 	}
+	if thc.attributesDiscarded {
+		// Opaque targets return from hashTarget before reaching this function.
+		return nil, fmt.Errorf("missing precomputed attribute hash state for rule %q after attributes were discarded", rule.GetName())
+	}
 	return hashRuleOwnAttributes(thc, rule, configuration)
 }
 
 func (thc *TargetHashCache) prehashRuleAttributes(rule *build.Rule) error {
 	// Query metadata has no configurations. Opaque rules contribute their identity
-	// only, so their attributes can be dropped without computing a prefix.
+	// only via hashTarget's opaque branch, which returns before hashRule. Their
+	// attributes can therefore be dropped without computing a prefix.
 	label, err := thc.normalizer.ParseCanonicalLabel(rule.GetName())
 	if err != nil {
 		return err
