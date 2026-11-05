@@ -41,6 +41,7 @@ go_test(
         "dirty_set_test.go",
         "hash_cache_test.go",
         "hash_compaction_test.go",
+        "hash_loading_test.go",
         "hash_persistence_test.go",
         "normalizer_test.go",
         "scoped_query_test.go",

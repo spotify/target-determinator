@@ -511,6 +511,17 @@ func streamMap(e *streamingObjectEncoder, m reflect.Value) {
 
 // LoadPersistedHashes loads persisted hash data from a JSON file
 func LoadPersistedHashes(filePath string) (*PersistedHashData, error) {
+	return loadPersistedData(filePath, readCompleteSeed)
+}
+
+type persistedReadMode int
+
+const (
+	readCompleteSeed persistedReadMode = iota
+	readHashesForDiff
+)
+
+func loadPersistedData(filePath string, mode persistedReadMode) (*PersistedHashData, error) {
 	file, err := os.Open(filePath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open hash file %s: %w", filePath, err)
@@ -519,11 +530,135 @@ func LoadPersistedHashes(filePath string) (*PersistedHashData, error) {
 
 	var persistedData PersistedHashData
 	decoder := json.NewDecoder(file)
-	if err := decoder.Decode(&persistedData); err != nil {
+	if err := decodePersistedData(decoder, &persistedData, mode); err != nil {
 		return nil, fmt.Errorf("failed to decode hash data from %s: %w", filePath, err)
 	}
 
 	return &persistedData, nil
+}
+
+// decodePersistedData walks fields for both seed loading and diffing. Seeds
+// decode their large maps entry by entry; diffing reads only commit SHA and
+// target hashes and stops before the dependency graph in the normal field order.
+func decodePersistedData(decoder *json.Decoder, data *PersistedHashData, mode persistedReadMode) error {
+	// Unknown fields can contain numbers outside float64's range. Tokenizing
+	// them as Number preserves encoding/json's behavior of ignoring their values.
+	decoder.UseNumber()
+	token, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	if token == nil {
+		return nil
+	}
+	if token != json.Delim('{') {
+		return fmt.Errorf("expected persisted hash object, got %v", token)
+	}
+	value := reflect.ValueOf(data).Elem()
+	for decoder.More() {
+		token, err := decoder.Token()
+		if err != nil {
+			return err
+		}
+		name := token.(string)
+		found := false
+		for _, field := range persistedDataFields {
+			if !strings.EqualFold(name, field.name) {
+				continue
+			}
+			if mode == readHashesForDiff && field.name != "git_commit_sha" && field.name != "target_hashes" {
+				break
+			}
+			found = true
+			destination := value.FieldByIndex(field.index)
+			// Seeds stream their large maps. The differ keeps bulk decoding of
+			// the much smaller target-hash map to preserve its fast path.
+			if field.stream && mode == readCompleteSeed {
+				err = decodePersistedMap(decoder, destination)
+			} else {
+				err = decoder.Decode(destination.Addr().Interface())
+			}
+			if err != nil {
+				return fmt.Errorf("field %s: %w", field.name, err)
+			}
+			// The differ needs only this pair. In the normal field order this
+			// returns before reading any dependency edges or dependency hashes.
+			if mode == readHashesForDiff && data.GitCommitSha != "" && data.TargetHashes != nil {
+				return nil
+			}
+			break
+		}
+		if !found {
+			if err := skipPersistedValue(decoder, mode); err != nil {
+				return err
+			}
+		}
+	}
+	_, err = decoder.Token()
+	return err
+}
+
+// decodePersistedMap decodes one map value at a time. Reuse existing maps so
+// repeated JSON fields merge as they do when decoding a struct with encoding/json.
+func decodePersistedMap(decoder *json.Decoder, destination reflect.Value) error {
+	token, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	if token == nil {
+		destination.SetZero()
+		return nil
+	}
+	if token != json.Delim('{') {
+		return fmt.Errorf("expected map object or null, got %v", token)
+	}
+	if destination.IsNil() {
+		destination.Set(reflect.MakeMap(destination.Type()))
+	}
+	for decoder.More() {
+		token, err := decoder.Token()
+		if err != nil {
+			return err
+		}
+		value := reflect.New(destination.Type().Elem())
+		if err := decoder.Decode(value.Interface()); err != nil {
+			return err
+		}
+		key := reflect.ValueOf(token.(string)).Convert(destination.Type().Key())
+		destination.SetMapIndex(key, value.Elem())
+	}
+	_, err = decoder.Token()
+	return err
+}
+
+// skipPersistedValue bounds buffering for seeds. The differ preserves its
+// buffered skip for speed when fields appear before the target-hash map.
+func skipPersistedValue(decoder *json.Decoder, mode persistedReadMode) error {
+	if mode == readHashesForDiff {
+		var skip json.RawMessage
+		return decoder.Decode(&skip)
+	}
+	token, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	if token != json.Delim('{') && token != json.Delim('[') {
+		return nil
+	}
+	depth := 1
+	for depth > 0 {
+		token, err = decoder.Token()
+		if err != nil {
+			return err
+		}
+		switch token {
+		case json.Delim('{'), json.Delim('['):
+			depth++
+		case json.Delim('}'), json.Delim(']'):
+			depth--
+		}
+	}
+	return nil
 }
 
 // HashDiff represents a difference between two hash files
@@ -573,62 +708,14 @@ type HashComparisonSummary struct {
 // Works correctly regardless of field order, but is fastest when
 // target_hashes precedes target_edges (see PersistedHashData struct comment).
 func loadHashesForDiff(filePath string) (string, map[string]map[string]string, error) {
-	file, err := os.Open(filePath)
+	data, err := loadPersistedData(filePath, readHashesForDiff)
 	if err != nil {
-		return "", nil, fmt.Errorf("failed to open hash file %s: %w", filePath, err)
+		return "", nil, err
 	}
-	defer file.Close()
-
-	dec := json.NewDecoder(file)
-
-	// Read opening {
-	if _, err := dec.Token(); err != nil {
-		return "", nil, fmt.Errorf("failed to read opening token from %s: %w", filePath, err)
-	}
-
-	var commitSha string
-	var hashes map[string]map[string]string
-
-	for dec.More() {
-		tok, err := dec.Token()
-		if err != nil {
-			return "", nil, fmt.Errorf("failed to read key from %s: %w", filePath, err)
-		}
-		key, ok := tok.(string)
-		if !ok {
-			continue
-		}
-
-		switch key {
-		case "git_commit_sha":
-			if err := dec.Decode(&commitSha); err != nil {
-				return "", nil, fmt.Errorf("failed to decode git_commit_sha from %s: %w", filePath, err)
-			}
-			if hashes != nil {
-				return commitSha, hashes, nil
-			}
-		case "target_hashes":
-			if err := dec.Decode(&hashes); err != nil {
-				return "", nil, fmt.Errorf("failed to decode target_hashes from %s: %w", filePath, err)
-			}
-			if commitSha != "" {
-				return commitSha, hashes, nil
-			}
-		default:
-			// Skip fields we don't need. This allocates and discards the
-			// value, which is unavoidable with encoding/json when a needed
-			// field appears after an unneeded one.
-			var skip json.RawMessage
-			if err := dec.Decode(&skip); err != nil {
-				return "", nil, fmt.Errorf("failed to skip field %q from %s: %w", key, filePath, err)
-			}
-		}
-	}
-
-	if hashes == nil {
+	if data.TargetHashes == nil {
 		return "", nil, fmt.Errorf("target_hashes not found in %s", filePath)
 	}
-	return commitSha, hashes, nil
+	return data.GitCommitSha, data.TargetHashes, nil
 }
 
 // CompareHashFiles compares two persisted hash files and returns the differences
