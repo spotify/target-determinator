@@ -53,7 +53,7 @@ func TestInsert(t *testing.T) {
 		got := s.SortedSlice()
 		want := []string{}
 		if !reflect.DeepEqual(got, want) {
-			t.Errorf("Before insert: wanted %v got %v")
+			t.Errorf("Before insert: wanted %v got %v", want, got)
 		}
 
 		if s.Contains("cheese") {
@@ -73,7 +73,7 @@ func TestInsert(t *testing.T) {
 		got := s.SortedSlice()
 		want := []string{"cheese"}
 		if !reflect.DeepEqual(got, want) {
-			t.Errorf("After one insert: wanted %v got %v")
+			t.Errorf("After one insert: wanted %v got %v", want, got)
 		}
 
 		if !s.Contains("cheese") {
@@ -93,7 +93,7 @@ func TestInsert(t *testing.T) {
 		got := s.SortedSlice()
 		want := []string{"cheese"}
 		if !reflect.DeepEqual(got, want) {
-			t.Errorf("After two inserts: wanted %v got %v")
+			t.Errorf("After two inserts: wanted %v got %v", want, got)
 		}
 
 		if !s.Contains("cheese") {
@@ -113,7 +113,7 @@ func TestInsert(t *testing.T) {
 		got := s.SortedSlice()
 		want := []string{"cheese", "onions"}
 		if !reflect.DeepEqual(got, want) {
-			t.Errorf("After three inserts: wanted %v got %v")
+			t.Errorf("After three inserts: wanted %v got %v", want, got)
 		}
 
 		if !s.Contains("cheese") {
@@ -133,7 +133,7 @@ func TestInsert(t *testing.T) {
 		got := s.SortedSlice()
 		want := []string{"brie", "cheese", "onions"}
 		if !reflect.DeepEqual(got, want) {
-			t.Errorf("After four inserts: wanted %v got %v")
+			t.Errorf("After four inserts: wanted %v got %v", want, got)
 		}
 
 		if !s.Contains("cheese") {
@@ -294,4 +294,32 @@ func TestFilterCustomComparator(t *testing.T) {
 	if !reflect.DeepEqual(want2, got2) {
 		t.Errorf("want %v got %v", want2, got2)
 	}
+}
+func TestSortedSet_NilSafety(t *testing.T) {
+	var nilSet *ss.SortedSet[string]
+
+	if nilSet.Len() != 0 {
+		t.Errorf("nilSet.Len() = %v, want 0", nilSet.Len())
+	}
+	if nilSet.Contains("apple") {
+		t.Errorf("nilSet.Contains() = true, want false")
+	}
+	if got := nilSet.SortedSlice(); got != nil {
+		t.Errorf("nilSet.SortedSlice() = %v, want nil", got)
+	}
+	if got := nilSet.Clone(); got != nil {
+		t.Errorf("nilSet.Clone() = %v, want nil", got)
+	}
+	if got := nilSet.Filter(func(s string) bool { return true }); got != nil {
+		t.Errorf("nilSet.Filter() = %v, want nil", got)
+	}
+
+	// AddAll with nil other or nil receiver should not panic
+	s := ss.NewSortedSet([]string{"banana"})
+	s.AddAll(nil)
+	if s.Len() != 1 || !s.Contains("banana") {
+		t.Errorf("s.AddAll(nil) corrupted set: %v", s.SortedSlice())
+	}
+
+	nilSet.AddAll(s) // should be a safe no-op
 }
