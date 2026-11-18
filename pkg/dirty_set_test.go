@@ -1111,6 +1111,44 @@ func TestPruneDirtySetReadsDependencyHashes(t *testing.T) {
 	}
 }
 
+func TestPruneDirtySetReportsProvenUnchangedLabels(t *testing.T) {
+	// //pkg:platform is a dependency-only label nothing in //pkg depends on;
+	// //pkg:lib changed. //pkg:wrapper is in the dirty package and was not
+	// changed itself, but depends on //pkg:lib, so it is not proven unchanged.
+	edges := map[string][]string{
+		"//pkg:platform": {},
+		"//pkg:lib":      {},
+		"//pkg:wrapper":  {"//pkg:lib"},
+		"//app:consumer": {"//pkg:platform"},
+	}
+	original := ComputeDirtySet(
+		map[string]string{"pkg/README.md": "M"}, edges, CollectAllLabels(edges, nil), nil, nil, nil,
+	)
+
+	platformHash := "aaaa0000aaaa0000aaaa0000aaaa0000aaaa0000aaaa0000aaaa0000aaaa0000"
+	wrapperHash := "cccc0000cccc0000cccc0000cccc0000cccc0000cccc0000cccc0000cccc0000"
+	seed := &PersistedHashData{
+		TargetHashes: map[string]map[string]string{
+			"//pkg:lib":     {"": "bbbb0000bbbb0000bbbb0000bbbb0000bbbb0000bbbb0000bbbb0000bbbb0000"},
+			"//pkg:wrapper": {"": wrapperHash},
+		},
+		DependencyHashes: map[string]map[string]string{"//pkg:platform": {"": platformHash}},
+		TargetEdges:      edges,
+	}
+	probe := ProbeResult{Hashes: map[string]string{
+		"//pkg:platform\x00": platformHash,
+		"//pkg:lib\x00":      "dddd0000dddd0000dddd0000dddd0000dddd0000dddd0000dddd0000dddd0000",
+		"//pkg:wrapper\x00":  wrapperHash,
+	}}
+
+	pruned := PruneDirtySet(original, seed, probe, nil)
+
+	assertStrings(t, "ProvenUnchanged", sortedKeys(pruned.ProvenUnchanged), []string{"//pkg:platform"})
+	if pruned.DirtyStarLabels["//app:consumer"] {
+		t.Error("//app:consumer should be pruned: //pkg:platform is unchanged")
+	}
+}
+
 func TestIsFallbackTriggerLockfiles(t *testing.T) {
 	tests := []struct {
 		basename string
