@@ -14,6 +14,11 @@ type DirtySetResult struct {
 	DirtyLabels map[string]bool
 	// DirtyStarLabels is DirtyLabels plus all transitive reverse deps.
 	DirtyStarLabels map[string]bool
+	// ProvenUnchanged is the subset of DirtyLabels that probe pruning proved
+	// unchanged and that no changed label reaches through reverse deps. Their
+	// seed hashes are still valid, so they can seed the scoped hash cache and
+	// be carried into the persisted output. It is empty until pruning runs.
+	ProvenUnchanged map[string]bool
 	// DirtyPackages is the sorted list of packages, existing at the target
 	// revision, whose targets must be re-listed with a package wildcard
 	// (e.g. //pkg:all) rather than by explicit label, so that targets added
@@ -107,7 +112,7 @@ func ComputeDirtySet(
 	result.RemovedPackages = sortedKeys(boundaries.removed)
 
 	// Propagate dirtiness through reverse deps.
-	result.DirtyStarLabels = propagateFrom(result.DirtyLabels, result.DirtyLabels, edges)
+	result.DirtyStarLabels, _ = propagateFrom(result.DirtyLabels, result.DirtyLabels, edges)
 	return result
 }
 
@@ -328,11 +333,19 @@ func PruneDirtySet(
 	changedFiles map[string]string,
 ) *DirtySetResult {
 	actuallyChanged := findChangedTargets(original.DirtyLabels, seed, probe, changedFiles)
-	newDirtyStar := propagateFrom(original.DirtyLabels, actuallyChanged, seed.TargetEdges)
+	newDirtyStar, reached := propagateFrom(original.DirtyLabels, actuallyChanged, seed.TargetEdges)
+
+	provenUnchanged := make(map[string]bool)
+	for label := range original.DirtyLabels {
+		if !reached[label] {
+			provenUnchanged[label] = true
+		}
+	}
 
 	return &DirtySetResult{
 		DirtyLabels:     original.DirtyLabels,
 		DirtyStarLabels: newDirtyStar,
+		ProvenUnchanged: provenUnchanged,
 		DirtyPackages:   original.DirtyPackages,
 		RemovedPackages: original.RemovedPackages,
 	}
@@ -395,8 +408,10 @@ func targetHashChanged(label string, seedConfigs map[string]string, probeHashes 
 }
 
 // propagateFrom builds DirtyStarLabels by including all directly dirty
-// labels and BFS-propagating rdeps only from the actuallyChanged subset.
-func propagateFrom(dirtyLabels, actuallyChanged map[string]bool, edges map[string][]string) map[string]bool {
+// labels and BFS-propagating rdeps only from the actuallyChanged subset. It
+// also returns the labels the walk reached: actuallyChanged and every
+// transitive rdep of it.
+func propagateFrom(dirtyLabels, actuallyChanged map[string]bool, edges map[string][]string) (map[string]bool, map[string]bool) {
 	rdeps := BuildRdeps(edges)
 
 	// Every directly dirty label is dirty* regardless of whether it
@@ -428,7 +443,7 @@ func propagateFrom(dirtyLabels, actuallyChanged map[string]bool, edges map[strin
 			}
 		}
 	}
-	return result
+	return result, visited
 }
 
 // nonLockfileExtensions are extensions a dependency lockfile never uses.

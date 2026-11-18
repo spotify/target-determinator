@@ -1060,9 +1060,21 @@ func doQueryDepsQueryMode(context *Context, targets TargetsList, normalizer *Nor
 		return nil, fmt.Errorf("failed to run top-level query: %w", err)
 	}
 
+	log.Println("Matching labels to configurations")
+	return assembleQueryModeResults(cache, transitiveConfiguredTargets, matchingLabels, bazelRelease), nil
+}
+
+// assembleQueryModeResults builds the QueryResults of a query-backend run
+// from its transitive targets and matching labels. In query mode every
+// target has the single empty configuration.
+func assembleQueryModeResults(
+	cache *TargetHashCache,
+	transitiveConfiguredTargets map[label.Label]map[Configuration]*analysis.ConfiguredTarget,
+	matchingLabels []label.Label,
+	bazelRelease string,
+) *QueryResults {
 	// In query mode, there are no configurations — use a single empty configuration for all targets.
 	emptyConfiguration := NormalizeConfiguration("")
-	log.Println("Matching labels to configurations")
 	labels := make([]label.Label, 0, len(matchingLabels))
 	labelsToConfigurations := make(map[label.Label][]Configuration)
 	for _, l := range matchingLabels {
@@ -1090,7 +1102,33 @@ func doQueryDepsQueryMode(context *Context, targets TargetsList, normalizer *Nor
 		QueryError:                  nil,
 		configurations:              map[Configuration]singleConfigurationOutput{},
 	}
-	return queryResults, nil
+	return queryResults
+}
+
+// NewQueryModeResults builds the QueryResults a query-backend run would
+// produce for the given transitive targets and matching labels, without
+// running Bazel. It lets callers outside this package, such as the
+// hash-persister tests, exercise hashing and persistence end to end.
+func NewQueryModeResults(targets []*build.Target, matching []string, bazelRelease string) (*QueryResults, error) {
+	normalizer := &Normalizer{}
+	configured := make([]*analysis.ConfiguredTarget, 0, len(targets))
+	for _, target := range targets {
+		configured = append(configured, &analysis.ConfiguredTarget{Target: target})
+	}
+	transitive, err := ParseCqueryResult(configured, normalizer)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse targets: %w", err)
+	}
+	matchingLabels := make([]label.Label, 0, len(matching))
+	for _, m := range matching {
+		l, err := normalizer.ParseCanonicalLabel(m)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse matching label %q: %w", m, err)
+		}
+		matchingLabels = append(matchingLabels, l)
+	}
+	cache := NewTargetHashCache(nil, normalizer, bazelRelease, true, nil)
+	return assembleQueryModeResults(cache, transitive, matchingLabels, bazelRelease), nil
 }
 
 func sortedStringKeys[V any](m map[label.Label]V) []string {

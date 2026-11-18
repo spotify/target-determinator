@@ -11,8 +11,10 @@ import (
 	"testing"
 
 	"github.com/bazel-contrib/target-determinator/pkg"
+	"github.com/bazel-contrib/target-determinator/third_party/protobuf/bazel/build"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/proto"
 )
 
 func TestValidateSeed(t *testing.T) {
@@ -432,6 +434,215 @@ func TestReusableSeedHashesCopiesHashesAndSkipsDirtyLabels(t *testing.T) {
 	hashes["//pkg:clean\x00cfg1"][0] = 0xff
 	assert.Equal(t, want["//pkg:clean\x00cfg2"], hashes["//pkg:clean\x00cfg2"])
 	assert.Equal(t, want["//dep:clean\x00cfg"], hashes["//dep:clean\x00cfg"])
+}
+
+func TestSeedSkipLabelsKeepsProvenUnchangedDependencyHashes(t *testing.T) {
+	// A dependency-only label in a dirty package that probe pruning proved
+	// unchanged must still seed the scoped cache, or the persisted output
+	// loses its dependency hash and the next seeded run treats it as new.
+	data := &pkg.PersistedHashData{
+		TargetHashes: map[string]map[string]string{
+			"//pkg:lib": {"": strings.Repeat("01", 32)},
+		},
+		DependencyHashes: map[string]map[string]string{
+			"//pkg:platform": {"": strings.Repeat("02", 32)},
+		},
+	}
+	dirtyResult := &pkg.DirtySetResult{
+		DirtyLabels:     map[string]bool{"//pkg:lib": true, "//pkg:platform": true},
+		DirtyStarLabels: map[string]bool{"//pkg:lib": true, "//pkg:platform": true, "//app:bin": true},
+		ProvenUnchanged: map[string]bool{"//pkg:platform": true},
+	}
+
+	hashes, err := reusableSeedHashes(data, seedSkipLabels(dirtyResult))
+	require.NoError(t, err)
+	assert.Equal(t, map[string][]byte{
+		"//pkg:platform\x00": []byte(strings.Repeat("\x02", 32)),
+	}, hashes)
+}
+
+func TestSeedSkipLabelsWithoutPruningSkipsAllDirtyStar(t *testing.T) {
+	dirtyStar := map[string]bool{"//pkg:lib": true, "//app:bin": true}
+	assert.Equal(t, dirtyStar, seedSkipLabels(&pkg.DirtySetResult{DirtyStarLabels: dirtyStar}))
+}
+
+// twoRunWorkspace models a workspace where //app:consumer depends on the
+// manual-tagged //:manual_tool, which reads //inputs:tool.txt. Only
+// //app:consumer and //:lib match the targets pattern.
+type twoRunWorkspace struct {
+	dir string
+}
+
+const twoRunBazelRelease = "release 9.0.0"
+
+func newTwoRunWorkspace(t *testing.T) *twoRunWorkspace {
+	t.Helper()
+	w := &twoRunWorkspace{dir: t.TempDir()}
+	w.write(t, "inputs/tool.txt", "tool v1")
+	w.write(t, "lib.txt", "lib")
+	w.write(t, "README.md", "readme v1")
+	return w
+}
+
+func (w *twoRunWorkspace) write(t *testing.T, rel, content string) {
+	t.Helper()
+	path := filepath.Join(w.dir, rel)
+	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o644))
+}
+
+func (w *twoRunWorkspace) rule(name, class string, line int, inputs ...string) *build.Target {
+	pkgPath := strings.TrimPrefix(strings.SplitN(name, ":", 2)[0], "//")
+	return &build.Target{
+		Type: build.Target_RULE.Enum(),
+		Rule: &build.Rule{
+			Name:      proto.String(name),
+			RuleClass: proto.String(class),
+			Location:  proto.String(fmt.Sprintf("%s:%d:1", filepath.Join(w.dir, pkgPath, "BUILD.bazel"), line)),
+			RuleInput: inputs,
+		},
+	}
+}
+
+func (w *twoRunWorkspace) source(name string) *build.Target {
+	parts := strings.SplitN(strings.TrimPrefix(name, "//"), ":", 2)
+	return &build.Target{
+		Type: build.Target_SOURCE_FILE.Enum(),
+		SourceFile: &build.SourceFile{
+			Name:     proto.String(name),
+			Location: proto.String(filepath.Join(w.dir, parts[0], parts[1]) + ":1:1"),
+		},
+	}
+}
+
+func (w *twoRunWorkspace) targets() map[string]*build.Target {
+	return map[string]*build.Target{
+		"//app:consumer":    w.rule("//app:consumer", "java_binary", 1, "//:manual_tool"),
+		"//:manual_tool":    w.rule("//:manual_tool", "genrule", 1, "//inputs:tool.txt"),
+		"//:lib":            w.rule("//:lib", "filegroup", 2, "//:lib.txt"),
+		"//inputs:tool.txt": w.source("//inputs:tool.txt"),
+		"//:lib.txt":        w.source("//:lib.txt"),
+	}
+}
+
+func (w *twoRunWorkspace) queryResults(t *testing.T, labels []string, matching []string) *pkg.QueryResults {
+	t.Helper()
+	all := w.targets()
+	targets := make([]*build.Target, 0, len(labels))
+	for _, l := range labels {
+		targets = append(targets, all[l])
+	}
+	results, err := pkg.NewQueryModeResults(targets, matching, twoRunBazelRelease)
+	require.NoError(t, err)
+	return results
+}
+
+// fullRun hashes the whole workspace as a non-seeded run would.
+func (w *twoRunWorkspace) fullRun(t *testing.T, cfg *config) *pkg.PersistedHashData {
+	t.Helper()
+	labels := make([]string, 0)
+	for l := range w.targets() {
+		labels = append(labels, l)
+	}
+	results := w.queryResults(t, labels, []string{"//app:consumer", "//:lib"})
+	require.NoError(t, results.PrefillCache())
+	data, err := mergePersistedData(&pkg.PersistedHashData{}, nil, nil, results, cfg, "fingerprint")
+	require.NoError(t, err)
+	return data
+}
+
+// seededRun mirrors runSeeded with the Bazel queries replaced by the probe
+// and scoped graphs Bazel would return at the target revision.
+func (w *twoRunWorkspace) seededRun(
+	t *testing.T,
+	cfg *config,
+	seed *pkg.PersistedHashData,
+	changedFiles map[string]string,
+	probeLabels []string,
+	scopedLabels []string,
+	scopedMatching []string,
+) *pkg.PersistedHashData {
+	t.Helper()
+	dirty := pkg.ComputeDirtySet(changedFiles, seed.TargetEdges,
+		pkg.CollectAllLabels(seed.TargetEdges, seed.TargetHashes), nil, nil, nil)
+	require.False(t, dirty.NeedsFallback, dirty.FallbackReason)
+
+	probe := w.queryResults(t, probeLabels, probeLabels)
+	probeSeed, err := buildExternalSeedHashes(seed, dirty.DirtyPackages)
+	require.NoError(t, err)
+	require.NoError(t, probe.TargetHashCache.SeedHashes(probeSeed))
+	require.NoError(t, probe.PrefillCache())
+	dirty = pkg.PruneDirtySet(dirty, seed, pkg.ProbeResult{
+		Hashes:      probe.TargetHashCache.ExtractHexHashes(),
+		SourceFiles: probe.TargetHashCache.SourceFileLabels(),
+	}, changedFiles)
+
+	scoped := w.queryResults(t, scopedLabels, scopedMatching)
+	skip := seedSkipLabels(dirty)
+	seedHashes, err := reusableSeedHashes(seed, skip)
+	require.NoError(t, err)
+	require.NoError(t, scoped.TargetHashCache.SeedHashes(seedHashes))
+	require.NoError(t, scoped.PrefillCache())
+	data, err := mergePersistedData(seed, dirty.DirtyStarLabels, skip, scoped, cfg, "fingerprint")
+	require.NoError(t, err)
+	return data
+}
+
+func TestSeededRunsKeepEdgesOfUnchangedDependencyOnlyLabels(t *testing.T) {
+	w := newTwoRunWorkspace(t)
+	targets, err := pkg.ParseTargetsList("//...")
+	require.NoError(t, err)
+	cfg := &config{
+		Context:        &pkg.Context{WorkspacePath: w.dir},
+		Targets:        targets,
+		SeedableOutput: true,
+	}
+	seed := w.fullRun(t, cfg)
+	require.Contains(t, seed.DependencyHashes, "//:manual_tool")
+	require.Equal(t, []string{"//inputs:tool.txt"}, seed.TargetEdges["//:manual_tool"])
+
+	// Run 1: a Markdown edit dirties the root package without changing any
+	// target. The scoped query lists //:all, which skips the manual target.
+	w.write(t, "README.md", "readme v2")
+	first := w.seededRun(t, cfg, seed,
+		map[string]string{"README.md": "M"},
+		[]string{"//:manual_tool", "//:lib", "//:lib.txt", "//inputs:tool.txt"},
+		[]string{"//:lib", "//:lib.txt"},
+		[]string{"//:lib"},
+	)
+	assert.Equal(t, seed.DependencyHashes["//:manual_tool"], first.DependencyHashes["//:manual_tool"])
+	assert.Equal(t, []string{"//inputs:tool.txt"}, first.TargetEdges["//:manual_tool"])
+
+	// Run 2, seeded from run 1: editing the tool's input in another package
+	// must reach //app:consumer through the carried edge.
+	w.write(t, "inputs/tool.txt", "tool v2")
+	second := w.seededRun(t, cfg, first,
+		map[string]string{"inputs/tool.txt": "M"},
+		[]string{"//inputs:tool.txt"},
+		[]string{"//app:consumer", "//:manual_tool", "//inputs:tool.txt"},
+		[]string{"//app:consumer"},
+	)
+	full := w.fullRun(t, cfg)
+	assert.NotEqual(t, seed.TargetHashes["//app:consumer"], second.TargetHashes["//app:consumer"])
+	assert.Equal(t, full.TargetHashes["//app:consumer"], second.TargetHashes["//app:consumer"])
+}
+
+func TestMergePersistedEdgesPrefersVisitedFreshGraph(t *testing.T) {
+	seed := map[string][]string{
+		"//pkg:unchanged_skipped": {"//dep:a"},
+		"//pkg:visited_now_leaf":  {"//dep:b"},
+		"//pkg:dirty":             {"//dep:c"},
+		"//other:untouched":       {"//dep:d"},
+	}
+	skip := map[string]bool{"//pkg:dirty": true}
+	fresh := map[string][]string{"//pkg:dirty": {"//dep:e"}}
+	visited := map[string]bool{"//pkg:visited_now_leaf": true, "//pkg:dirty": true}
+
+	assert.Equal(t, map[string][]string{
+		"//pkg:unchanged_skipped": {"//dep:a"},
+		"//pkg:dirty":             {"//dep:e"},
+		"//other:untouched":       {"//dep:d"},
+	}, mergePersistedEdges(seed, skip, fresh, visited))
 }
 
 func BenchmarkValidateSeed(b *testing.B) {

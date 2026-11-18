@@ -18,8 +18,10 @@ go_test(
     embed = [":hash-persister_lib"],
     deps = [
         "//pkg",
+        "//third_party/protobuf/bazel/build",
         "@com_github_stretchr_testify//assert",
         "@com_github_stretchr_testify//require",
+        "@org_golang_google_protobuf//proto",
     ],
 )
 

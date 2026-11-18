@@ -379,7 +379,8 @@ func runSeeded(cfg *config) (seededOutcome, error) {
 	log.Printf("Phase scoped query+parse completed in %v", time.Since(phaseStart))
 
 	phaseStart = time.Now()
-	seedHashes, err := reusableSeedHashes(seedData, dirtyResult.DirtyStarLabels)
+	skipLabels := seedSkipLabels(dirtyResult)
+	seedHashes, err := reusableSeedHashes(seedData, skipLabels)
 	if err != nil {
 		cleanup()
 		return fallback("seed_hash_invalid", fmt.Sprintf("seed contains invalid hashes: %v", err))
@@ -401,7 +402,7 @@ func runSeeded(cfg *config) (seededOutcome, error) {
 	log.Printf("Phase hash completed in %v", time.Since(phaseStart))
 
 	phaseStart = time.Now()
-	persistedData, err := mergePersistedData(seedData, dirtyResult.DirtyStarLabels, queryResults, cfg, compatibilityFingerprint)
+	persistedData, err := mergePersistedData(seedData, dirtyResult.DirtyStarLabels, skipLabels, queryResults, cfg, compatibilityFingerprint)
 	if err != nil {
 		return seededOutcome{}, err
 	}
@@ -415,6 +416,7 @@ func runSeeded(cfg *config) (seededOutcome, error) {
 	seedData = nil
 	dirtyResult = nil
 	seedHashes = nil
+	skipLabels = nil
 	allLabels = nil
 
 	if err := pkg.WritePersistedData(cfg.OutputFile, persistedData); err != nil {
@@ -626,6 +628,26 @@ func validateSeedHashes(seedData *pkg.PersistedHashData) error {
 	return decodeSeedHashes(seedData, nil, nil)
 }
 
+// seedSkipLabels returns the labels whose seed hashes must not seed the
+// scoped hash cache: dirty* labels, except the directly dirty labels that
+// probe pruning proved unchanged. Seeding those keeps their hashes in the
+// cache, so that dependency-only labels in a dirty package (platforms, npm
+// links, manual targets) that no recomputed target reaches still get a
+// dependency hash in the persisted output. Without it they are dropped, and
+// the next seeded run sees them as new and propagates all their rdeps.
+func seedSkipLabels(dirtyResult *pkg.DirtySetResult) map[string]bool {
+	if len(dirtyResult.ProvenUnchanged) == 0 {
+		return dirtyResult.DirtyStarLabels
+	}
+	skip := make(map[string]bool, len(dirtyResult.DirtyStarLabels))
+	for label := range dirtyResult.DirtyStarLabels {
+		if !dirtyResult.ProvenUnchanged[label] {
+			skip[label] = true
+		}
+	}
+	return skip
+}
+
 func reusableSeedHashes(seedData *pkg.PersistedHashData, dirtyLabels map[string]bool) (map[string][]byte, error) {
 	hashes := make(map[string][]byte)
 	if err := decodeSeedHashes(seedData, dirtyLabels, hashes); err != nil {
@@ -665,6 +687,7 @@ func decodeSeedHashes(seedData *pkg.PersistedHashData, dirtyLabels map[string]bo
 func mergePersistedData(
 	seedData *pkg.PersistedHashData,
 	dirtyLabels map[string]bool,
+	edgeSkipLabels map[string]bool,
 	queryResults *pkg.QueryResults,
 	cfg *config,
 	compatibilityFingerprint string,
@@ -693,14 +716,18 @@ func mergePersistedData(
 	}
 
 	freshEdges := make(map[string][]string)
+	visited := make(map[string]bool, len(queryResults.TransitiveConfiguredTargets))
 	if queryResults.TransitiveConfiguredTargets != nil {
 		var err error
 		freshEdges, err = pkg.ExtractEdges(queryResults)
 		if err != nil {
 			return nil, fmt.Errorf("failed to extract fresh edges: %w", err)
 		}
+		for lbl := range queryResults.TransitiveConfiguredTargets {
+			visited[lbl.String()] = true
+		}
 	}
-	mergedEdges := mergePersistedEntries(seedData.TargetEdges, dirtyLabels, freshEdges)
+	mergedEdges := mergePersistedEdges(seedData.TargetEdges, edgeSkipLabels, freshEdges, visited)
 	persistedData.DependencyHashes = pkg.ExtractDependencyHashes(persistedData.TargetHashes, mergedEdges, queryResults.TargetHashCache)
 	persistedData.FormatVersion = pkg.CurrentPersistedHashFormatVersion
 	persistedData.SeedCompatibilityFingerprint = compatibilityFingerprint
@@ -738,6 +765,26 @@ func newPersistedOutput(
 
 // mergePersistedEntries retains clean seed entries and overlays entries read
 // from the destination revision. A dirty entry absent from fresh is deleted.
+// mergePersistedEdges merges the seed's dependency edges with those of the
+// scoped query. A label the scoped query visited takes its edges from the
+// fresh graph alone, including when it has none, since ExtractEdges omits
+// labels without dependencies. Any other label keeps its seed edges unless
+// it is in skip. Probe-proven unchanged labels are left out of skip, so a
+// dependency-only label the scoped query never reaches keeps its outgoing
+// edges, and a later change below it still propagates to its rdeps.
+func mergePersistedEdges(seed map[string][]string, skip map[string]bool, fresh map[string][]string, visited map[string]bool) map[string][]string {
+	merged := make(map[string][]string, len(seed)+len(fresh))
+	for label, deps := range seed {
+		if !skip[label] && !visited[label] {
+			merged[label] = deps
+		}
+	}
+	for label, deps := range fresh {
+		merged[label] = deps
+	}
+	return merged
+}
+
 func mergePersistedEntries[V any](seed map[string]V, dirty map[string]bool, fresh map[string]V) map[string]V {
 	merged := make(map[string]V, len(seed)+len(fresh))
 	for label, value := range seed {
